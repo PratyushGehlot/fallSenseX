@@ -1,0 +1,19 @@
+{
+  "commands": [
+    {
+      "command": "AT\\n",
+      "expected": "OK",
+      "delay": 100
+    },
+    {
+      "command": "AT+START\\n",
+      "expected": "OK",
+      "delay": 100
+    },
+    {
+      "command": "AT+STOP\\n",
+      "expected": "OK",
+      "delay": 100
+    }
+  ]
+}

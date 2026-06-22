@@ -35,6 +35,14 @@
 #define GRID_Z 2.5f//3.0f
 
 #define FALL_CONFIRMATION_THRESHOLD 2
+/* Hysteresis margin (meters) on the standing/sitting height thresholds -
+ * widens the band in favor of staying in the current posture, so a
+ * height estimate jittering right at a threshold doesn't flip the
+ * reported posture every frame. */
+#define POSTURE_HEIGHT_HYSTERESIS_M 0.08f
+/* Consecutive frames a new posture must win before it replaces the
+ * reported one - see target_track_t.pending_posture. */
+#define POSTURE_DEBOUNCE_FRAMES 3
 
 static const char *TAG = "radar_sensor";
 
@@ -79,6 +87,12 @@ typedef struct {
     int recovery_counter;
 
     human_posture_t prev_posture;
+    /* Debounce: a posture must be classified consistently for
+     * POSTURE_DEBOUNCE_FRAMES consecutive frames before it replaces
+     * prev_posture, so single-frame noise that survives smoothing and
+     * hysteresis still can't flip the reported posture. */
+    human_posture_t pending_posture;
+    uint8_t pending_count;
 } target_track_t;
 
 static target_track_t s_tracks[RADAR_MAX_TARGETS];
@@ -86,12 +100,24 @@ static uint8_t s_next_track_id = 1;
 
 typedef struct {
     float cx, cy, cz;
+    /* z_max is the 85th-percentile height of the cluster's points, not the
+     * literal maximum - a single noisy/reflected point spiking upward
+     * (multipath, ceiling bounce) used to be able to push the true max
+     * high enough to misclassify posture for a whole frame. The
+     * percentile is far less sensitive to one outlier point. */
     float z_min, z_max, z_range;
     float xy_span_x, xy_span_y, xy_span;
     float v_mean, v_var;
     float confidence;
     int point_count;
 } cluster_features_t;
+
+static int float_cmp(const void *a, const void *b)
+{
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
 
 esp_err_t radar_send_command(const char *cmd, char *response, size_t resp_size, int timeout_ms)
 {
@@ -127,32 +153,32 @@ esp_err_t radar_configure(void)
     ret = radar_send_command("AT+STOP\n", resp, sizeof(resp), 200);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AT+STOP failed");
-    }
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+            }
+                vTaskDelay(200 / portTICK_PERIOD_MS);
 
     ret = radar_send_command("AT+PROG=02\n", resp, sizeof(resp), 200);
-    if (ret != ESP_OK) {
+        if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AT+PROG=02 failed");
-    }
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+        }
+        vTaskDelay(200 / portTICK_PERIOD_MS);
 
     ret = radar_send_command("AT+DEBUG=0\n", resp, sizeof(resp), 200);
-    if (ret != ESP_OK) {
+        if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AT+DEBUG=0 failed");
-    }
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+        }
+        vTaskDelay(200 / portTICK_PERIOD_MS);
 
     ret = radar_send_command("AT+HEATIME=60\n", resp, sizeof(resp), 200);
-    if (ret != ESP_OK) {
+        if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AT+HEATIME=60 failed");
-    }
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+        }
+        vTaskDelay(200 / portTICK_PERIOD_MS);
 
     ret = radar_send_command("AT+SENS=3\n", resp, sizeof(resp), 200);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "AT+SENS=3 failed");
-    }
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "AT+SENS=3 failed");
+        }
+        vTaskDelay(200 / portTICK_PERIOD_MS);
 #endif
     return ESP_OK;
 }
@@ -166,6 +192,7 @@ esp_err_t radar_start(void)
 
     ESP_LOGW(TAG, "AT+START\n");
     char resp[64];
+    ret = radar_send_command("AT+DEBUG=1\n", resp, sizeof(resp), 500);
     ret = radar_send_command("AT+START\n", resp, sizeof(resp), 500);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "AT+START failed");
@@ -174,6 +201,7 @@ esp_err_t radar_start(void)
     {
         ESP_LOGI(TAG, "AT+START succeeded");
     }
+    
     return ret;
 }
 
@@ -214,6 +242,7 @@ static void compute_cluster_features(int cluster_id[], int filtered_idx[], int f
     float y_min = 1e9f, y_max = -1e9f;
     float z_min = 1e9f, z_max = -1e9f;
     float v_mean = 0, v_M2 = 0;
+    float z_vals[RADAR_MAX_POINTS];
     int n = 0;
 
     for (int i = 0; i < filtered_count; i++) {
@@ -231,6 +260,7 @@ static void compute_cluster_features(int cluster_id[], int filtered_idx[], int f
         if (p->y > y_max) y_max = p->y;
         if (p->z < z_min) z_min = p->z;
         if (p->z > z_max) z_max = p->z;
+        z_vals[n] = p->z;
 
         n++;
         float dv = p->velocity - v_mean;
@@ -245,8 +275,12 @@ static void compute_cluster_features(int cluster_id[], int filtered_idx[], int f
     feat->cy = sum_y / n;
     feat->cz = sum_z / n;
     feat->z_min = z_min;
-    feat->z_max = z_max;
-    feat->z_range = z_max - z_min;
+
+    qsort(z_vals, n, sizeof(float), float_cmp);
+    int p85_idx = (int)(0.85f * (n - 1) + 0.5f);
+    if (p85_idx >= n) p85_idx = n - 1;
+    feat->z_max = z_vals[p85_idx];
+    feat->z_range = feat->z_max - z_min;
     feat->xy_span_x = x_max - x_min;
     feat->xy_span_y = y_max - y_min;
     feat->xy_span = fmaxf(feat->xy_span_x, feat->xy_span_y);
@@ -257,28 +291,42 @@ static void compute_cluster_features(int cluster_id[], int filtered_idx[], int f
     feat->confidence = 0.6f * mean_conf + 0.4f * fminf((float)n / 15.0f, 1.0f);
 }
 
-static human_posture_t classify_posture(const cluster_features_t *f, const radar_config_t *cfg)
+/* Classifies posture from already-smoothed (EMA'd) track values rather
+ * than this frame's raw cluster stats - classifying on raw per-frame
+ * data made posture flip every time a single point jittered near a
+ * threshold. prev_posture drives hysteresis: the height bar to leave a
+ * posture is lower than the bar to enter it, so a value sitting right on
+ * a threshold doesn't oscillate the result. */
+static human_posture_t classify_posture(float height, float z_range, float xy_span,
+                                        float v_mean, float v_var,
+                                        const radar_config_t *cfg, human_posture_t prev_posture)
 {
-    float height = f->z_max;
+    float standing_enter = cfg->standing_z + POSTURE_HEIGHT_HYSTERESIS_M;
+    float standing_exit  = cfg->standing_z - POSTURE_HEIGHT_HYSTERESIS_M;
+    float sitting_enter  = cfg->sitting_z + POSTURE_HEIGHT_HYSTERESIS_M;
+    float sitting_exit   = cfg->sitting_z - POSTURE_HEIGHT_HYSTERESIS_M;
 
-    if (height >= cfg->standing_z && f->z_range > 0.4f && f->xy_span < 1.2f) {
+    bool standing_ok = (prev_posture == POSTURE_STANDING) ? (height >= standing_exit) : (height >= standing_enter);
+    if (standing_ok && z_range > 0.4f && xy_span < 1.2f) {
         return POSTURE_STANDING;
     }
-    if (height >= cfg->sitting_z && f->z_range > 0.2f) {
+
+    bool sitting_ok = (prev_posture == POSTURE_SITTING) ? (height >= sitting_exit) : (height >= sitting_enter);
+    if (sitting_ok && z_range > 0.2f) {
         return POSTURE_SITTING;
     }
 
     bool is_lying = (height < cfg->lying_z + 0.2f) ||
-                    (f->z_range < cfg->fall_z_range_lying && f->xy_span > cfg->fall_xy_spread_lying);
+                    (z_range < cfg->fall_z_range_lying && xy_span > cfg->fall_xy_spread_lying);
 
     if (is_lying) {
-        if (fabsf(f->v_mean) < cfg->v_move_threshold && f->v_var < cfg->v_move_threshold * cfg->v_move_threshold) {
+        if (fabsf(v_mean) < cfg->v_move_threshold && v_var < cfg->v_move_threshold * cfg->v_move_threshold) {
             return POSTURE_SLEEPING;
         }
         return POSTURE_LYING;
     }
 
-    if (height >= cfg->sitting_z) {
+    if (height >= sitting_exit) {
         return POSTURE_SITTING;
     }
     return POSTURE_LYING;
@@ -417,7 +465,16 @@ static void detect_humans(void)
             cluster_id[neighbors[n]] = cid;
         }
 
-        for (int iter = 0; iter < 3; iter++) {
+        /* Region-growing must continue until a full pass adds no new
+         * points, not just a fixed number of hops - capping this at 3
+         * iterations (the previous version) silently truncated clusters
+         * whose points formed a chain longer than 3 hops apart, which
+         * made z_max/xy_span (and therefore posture) sensitive to point
+         * ordering and density instead of being a correct, complete
+         * cluster every frame. */
+        bool changed = true;
+        while (changed) {
+            changed = false;
             for (int k = 0; k < filtered_count; k++) {
                 if (cluster_id[k] != cid) continue;
                 radar_point_t *pk = &s_frame_points[filtered_idx[k]];
@@ -426,6 +483,7 @@ static void detect_humans(void)
                     radar_point_t *pm = &s_frame_points[filtered_idx[m]];
                     if (distance_2d(pk->x, pk->y, pm->x, pm->y) <= s_config.eps) {
                         cluster_id[m] = cid;
+                        changed = true;
                     }
                 }
             }
@@ -495,8 +553,42 @@ static void detect_humans(void)
 
         target_track_t *tr = &s_tracks[ti];
         tr->missed_frames = 0;
+        bool has_history = (tr->prev_t_us > 0);
 
-        human_posture_t base_posture = classify_posture(f, &s_config);
+        /* Smooth first, classify second - see classify_posture()'s
+         * comment. EMA the track's positional/shape features using this
+         * frame's raw cluster stats, then classify off the smoothed
+         * result instead of the raw one. */
+        #define EMA_ALPHA 0.4f
+        tr->x       = has_history ? (EMA_ALPHA * f->cx + (1.0f - EMA_ALPHA) * tr->x)       : f->cx;
+        tr->y       = has_history ? (EMA_ALPHA * f->cy + (1.0f - EMA_ALPHA) * tr->y)       : f->cy;
+        tr->z       = has_history ? (EMA_ALPHA * f->cz + (1.0f - EMA_ALPHA) * tr->z)       : f->cz;
+        tr->v       = has_history ? (EMA_ALPHA * f->v_mean + (1.0f - EMA_ALPHA) * tr->v)   : f->v_mean;
+        tr->z_max   = has_history ? (EMA_ALPHA * f->z_max + (1.0f - EMA_ALPHA) * tr->z_max)   : f->z_max;
+        tr->z_range = has_history ? (EMA_ALPHA * f->z_range + (1.0f - EMA_ALPHA) * tr->z_range) : f->z_range;
+        tr->xy_span = has_history ? (EMA_ALPHA * f->xy_span + (1.0f - EMA_ALPHA) * tr->xy_span) : f->xy_span;
+        tr->v_var   = has_history ? (EMA_ALPHA * f->v_var + (1.0f - EMA_ALPHA) * tr->v_var)   : f->v_var;
+
+        human_posture_t candidate = classify_posture(tr->z_max, tr->z_range, tr->xy_span,
+                                                      tr->v, tr->v_var, &s_config, tr->prev_posture);
+
+        /* Debounce: even after smoothing + hysteresis, only switch the
+         * reported posture once a new candidate wins POSTURE_DEBOUNCE_FRAMES
+         * consecutive frames in a row. */
+        human_posture_t base_posture;
+        if (candidate == tr->prev_posture || tr->prev_posture == POSTURE_UNKNOWN) {
+            base_posture = candidate;
+            tr->pending_posture = candidate;
+            tr->pending_count = 0;
+        } else if (candidate == tr->pending_posture) {
+            tr->pending_count++;
+            base_posture = (tr->pending_count >= POSTURE_DEBOUNCE_FRAMES) ? candidate : tr->prev_posture;
+        } else {
+            tr->pending_posture = candidate;
+            tr->pending_count = 1;
+            base_posture = tr->prev_posture;
+        }
+
         update_track_fall_state(tr, f, base_posture, now);
 
         human_posture_t final_posture = base_posture;
@@ -505,16 +597,6 @@ static void detect_humans(void)
         } else if (tr->fall_state == FALL_SUSPECT) {
             final_posture = base_posture;
         }
-
-        #define EMA_ALPHA 0.4f
-        tr->x  = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->cx + (1.0f - EMA_ALPHA) * tr->x)  : f->cx;
-        tr->y  = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->cy + (1.0f - EMA_ALPHA) * tr->y)  : f->cy;
-        tr->z  = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->cz + (1.0f - EMA_ALPHA) * tr->z)  : f->cz;
-        tr->v  = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->v_mean + (1.0f - EMA_ALPHA) * tr->v) : f->v_mean;
-        tr->z_max   = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->z_max + (1.0f - EMA_ALPHA) * tr->z_max) : f->z_max;
-        tr->z_range = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->z_range + (1.0f - EMA_ALPHA) * tr->z_range) : f->z_range;
-        tr->xy_span = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->xy_span + (1.0f - EMA_ALPHA) * tr->xy_span) : f->xy_span;
-        tr->v_var   = (tr->prev_t_us > 0) ? (EMA_ALPHA * f->v_var + (1.0f - EMA_ALPHA) * tr->v_var) : f->v_var;
 
         tr->prev_z = f->cz;
         tr->prev_v = f->v_mean;
@@ -546,7 +628,8 @@ static void detect_humans(void)
     s_target_count = new_target_count;
     xSemaphoreGive(s_data_mutex);
 
-    if (s_config.detection_cb != NULL && new_target_count > 0) {
+    // Call the detection callback if registered
+    if (s_config.detection_cb != NULL /* && new_target_count > 0 */) {
         s_config.detection_cb(new_targets, new_target_count);
     }
 }
@@ -565,15 +648,17 @@ static bool parse_point_line(const char *line, radar_point_t *point)
         return false;
     }
 
-    //Parse raw values 
+    // Parse raw values (radar gives corner-based coordinates: 0..GRID_X, 0..GRID_Y)
     float raw_x = (float)atof(px + 2);
     float raw_y = (float)atof(py + 2);
     float raw_z = (float)atof(pz + 2);
 
-    //Transform coordinates 
-    point->x = raw_x + (GRID_X / 2.0f);// center x-axis
-    point->y = raw_y + (GRID_Y / 2.0f); // Center y-axis
-    point->z = GRID_Z - raw_z; // z is already height from ground, invert Z axis
+    // No transformation on ESP32 side - send raw coordinates
+    // App will handle centering based on configured room size
+    point->x = raw_x;
+    point->y = raw_y;
+    point->z = raw_z;
+    
 
     point->velocity = (float)atof(pv + 2);
     point->snr = (float)atof(psnr + 4);
@@ -597,6 +682,8 @@ static void radar_rx_task(void *arg)
         return;
     }
 
+    ESP_LOGI(TAG, "Radar RX task started");
+
     while (s_running) {
         int rx_len = uart_read_bytes(RADAR_UART_NUM, rx_buf, 255, 100 / portTICK_PERIOD_MS);
         if (rx_len <= 0) {
@@ -613,16 +700,16 @@ static void radar_rx_task(void *arg)
 
                 if (strstr(line_buf, "-----PointNum") != NULL) {
                     s_frame_counter++;
-                    ESP_LOGD(TAG, "Frame #%d received, %d points", s_frame_counter, s_frame_point_count);
+                    ////ESP_LOGI(TAG, "Frame #%d received, %d points", s_frame_counter, s_frame_point_count);
                     detect_humans();
                     s_frame_point_count = 0;
                 } else {
                     radar_point_t point;
                     if (parse_point_line(line_buf, &point) && s_frame_point_count < RADAR_MAX_POINTS) {
                         s_frame_points[s_frame_point_count++] = point;
-                        ESP_LOGD(TAG, "Point[%d]: x=%.2f y=%.2f z=%.2f v=%.2f snr=%.1f abs=%.1f dpk=%.1f",
-                                 s_frame_point_count - 1, point.x, point.y, point.z,
-                                 point.velocity, point.snr, point.abs_val, point.dpk);
+                        //ESP_LOGI(TAG, "Point[%d]: x=%.2f y=%.2f z=%.2f v=%.2f snr=%.1f abs=%.1f dpk=%.1f",
+                        //         s_frame_point_count - 1, point.x, point.y, point.z,
+                        //         point.velocity, point.snr, point.abs_val, point.dpk);
                     }
                 }
 
@@ -654,7 +741,6 @@ static esp_err_t radar_uart_init(void)
         ESP_LOGE(TAG, "Failed to install UART driver: %s", esp_err_to_name(ret));
         return ret;
     }
-
     ret = uart_param_config(RADAR_UART_NUM, &uart_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure UART: %s", esp_err_to_name(ret));
@@ -665,6 +751,7 @@ static esp_err_t radar_uart_init(void)
                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set UART pins: %s", esp_err_to_name(ret));
+
         return ret;
     }
 

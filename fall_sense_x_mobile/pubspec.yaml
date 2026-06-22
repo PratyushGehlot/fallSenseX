@@ -1,0 +1,39 @@
+name: fall_sense_x_mobile
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # Firebase
+  firebase_core: ^2.15.0
+  firebase_auth: ^4.9.0
+  firebase_database: ^10.4.0
+  firebase_messaging: ^14.9.0
+
+  # Local notifications
+  flutter_local_notifications: ^17.0.0
+
+  # Charting
+  fl_chart: ^0.66.2
+
+  # 3D visualization via WebView + Three.js
+  webview_flutter: ^4.13.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/radar_3d.html

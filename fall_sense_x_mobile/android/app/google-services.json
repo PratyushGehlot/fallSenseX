@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "658583987580",
+    "firebase_url": "https://chakshufallsense-default-rtdb.firebaseio.com",
+    "project_id": "chakshufallsense",
+    "storage_bucket": "chakshufallsense.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:658583987580:android:77d0dc0fa3693c381930f9",
+        "android_client_info": {
+          "package_name": "com.example.fall_sense_x_mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD6QNr8F0vfsNCgE2BwkSxlgNZxQBjTETw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

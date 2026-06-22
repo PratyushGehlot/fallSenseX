@@ -1,0 +1,4 @@
+version: "1.0.0"
+description: WS2812 RGB LED Driver using ESP-IDF led_strip component
+dependencies:
+  espressif/led_strip: "^2.0"

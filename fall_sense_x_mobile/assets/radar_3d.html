@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>3D Radar</title>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; background: #000; touch-action: none; }
+    #container { width: 100vw; height: 100vh; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+     let scene, camera, renderer, controls;
+     let pointCloud;
+     let boxPool = [];   // pooled bounding boxes, reused across frames
+     let labelPool = []; // pooled labels, parallel to boxPool
+     let roomOutline, sensorBox;
+     let roomLength = 6, roomWidth = 6, roomHeight = 2.5;  // Default to radar coverage area (meters)
+
+     function createRoom() {
+       // Remove existing room geometry if present
+       if (roomOutline) { scene.remove(roomOutline); roomOutline = null; }
+       if (sensorBox) { scene.remove(sensorBox); sensorBox = null; }
+
+       // Single wireframe box for the whole room - corner at origin, far
+       // corner at (roomLength, roomHeight, roomWidth). Simpler/cleaner than
+       // a floor grid + two wall grids.
+       const roomGeom = new THREE.BoxGeometry(roomLength, roomHeight, roomWidth);
+       const roomEdges = new THREE.EdgesGeometry(roomGeom);
+       const roomMat = new THREE.LineBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.5 });
+       roomOutline = new THREE.LineSegments(roomEdges, roomMat);
+       roomOutline.position.set(roomLength / 2, roomHeight / 2, roomWidth / 2);
+       scene.add(roomOutline);
+
+       // Small box on the ceiling, centered - represents the FallSenseX
+       // sensor's typical ceiling-mount position.
+       const sensorSize = Math.min(roomLength, roomWidth, roomHeight) * 0.06 + 0.05;
+       const sensorGeom = new THREE.BoxGeometry(sensorSize, sensorSize * 0.6, sensorSize);
+       const sensorMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x333333 });
+       sensorBox = new THREE.Mesh(sensorGeom, sensorMat);
+       sensorBox.position.set(roomLength / 2, roomHeight - sensorSize * 0.3, roomWidth / 2);
+       scene.add(sensorBox);
+
+       // Update camera to view the room nicely
+       const target = new THREE.Vector3(roomLength / 2, roomHeight / 2, roomWidth / 2);
+       camera.position.set(
+         target.x + roomLength * 0.6,
+         target.y + roomHeight * 0.8,
+         target.z + roomWidth * 1.2
+       );
+       camera.lookAt(target);
+       controls.target.copy(target);
+       controls.update();
+     }
+
+     function init() {
+       const container = document.getElementById('container');
+       scene = new THREE.Scene();
+       scene.background = new THREE.Color(0x000000);
+
+       const aspect = window.innerWidth / window.innerHeight;
+       camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 1000);
+
+       renderer = new THREE.WebGLRenderer({ antialias: true });
+       renderer.setSize(window.innerWidth, window.innerHeight);
+       renderer.setPixelRatio(devicePixelRatio);
+       container.appendChild(renderer.domElement);
+
+       controls = new THREE.OrbitControls(camera, renderer.domElement);
+       controls.enableDamping = true;
+       controls.dampingFactor = 0.05;
+       controls.screenSpacePanning = true;
+       controls.minDistance = 1;
+       controls.maxDistance = 50;
+       controls.maxPolarAngle = Math.PI / 2 + 0.1;
+
+       // Lights
+       scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+       const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+       dirLight.position.set(roomLength/2, roomHeight, roomWidth);
+       scene.add(dirLight);
+
+       // Create room geometry
+       createRoom();
+
+       // Point cloud
+       const maxPoints = 10000;
+       const posArray = new Float32Array(maxPoints * 3);
+       const colArray = new Float32Array(maxPoints * 3);
+       const geom = new THREE.BufferGeometry();
+       geom.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+       geom.setAttribute('color', new THREE.BufferAttribute(colArray, 3));
+       geom.setDrawRange(0, 0);
+       const mat = new THREE.PointsMaterial({
+         size: 0.08, vertexColors: true, sizeAttenuation: true,
+         transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending
+       });
+       pointCloud = new THREE.Points(geom, mat);
+       pointCloud.visible = false;
+       scene.add(pointCloud);
+
+       window.addEventListener('resize', onResize);
+       animate();
+       if (window.onThreeInitialized) window.onThreeInitialized();
+     }
+
+     // Grows the box/label pool to at least `count` entries (never shrinks -
+     // entries are just hidden when not needed for the current frame).
+     function ensurePoolSize(count) {
+       while (boxPool.length < count) {
+         const boxGeom = new THREE.BoxGeometry(1, 1, 1);
+         const edges = new THREE.EdgesGeometry(boxGeom);
+         const lineMat = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2 });
+         const box = new THREE.LineSegments(edges, lineMat);
+         box.visible = false;
+         scene.add(box);
+         boxPool.push(box);
+
+         const mat = new THREE.SpriteMaterial({ transparent: true, opacity: 0.95 });
+         const label = new THREE.Sprite(mat);
+         label.scale.set(3, 0.75, 1);
+         label.visible = false;
+         scene.add(label);
+         labelPool.push(label);
+       }
+     }
+
+     function labelTexture(text, color) {
+       const canvas = document.createElement('canvas');
+       const ctx = canvas.getContext('2d');
+       canvas.width = 512; canvas.height = 128;
+       ctx.fillStyle = `rgba(${color.r},${color.g},${color.b},0.3)`;
+       ctx.beginPath(); ctx.roundRect(0,0,512,128,10); ctx.fill();
+       ctx.fillStyle = 'white'; ctx.font = 'bold 32px Arial'; ctx.textAlign = 'center';
+       ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 8;
+       ctx.fillText(text, 256, 80);
+       return new THREE.CanvasTexture(canvas);
+     }
+
+     function onResize() {
+       camera.aspect = window.innerWidth / window.innerHeight;
+       camera.updateProjectionMatrix();
+       renderer.setSize(window.innerWidth, window.innerHeight);
+     }
+
+     function animate() {
+       requestAnimationFrame(animate);
+       controls.update();
+       renderer.render(scene, camera);
+     }
+
+     // Update point cloud
+     function updatePoints(points) {
+       if (!pointCloud) return;
+       const pos = pointCloud.geometry.attributes.position.array;
+       const col = pointCloud.geometry.attributes.color.array;
+       const count = Math.min(points.length, 10000);
+       for (let i = 0; i < count; i++) {
+         const p = points[i];
+         pos[i*3] = p.x; pos[i*3+1] = p.y; pos[i*3+2] = p.z;
+         const t = Math.min(Math.abs(p.velocity)/5, 1);
+         col[i*3] = t; col[i*3+1] = 1 - t*0.5; col[i*3+2] = 0;
+       }
+       pointCloud.geometry.attributes.position.needsUpdate = true;
+       pointCloud.geometry.attributes.color.needsUpdate = true;
+       pointCloud.geometry.setDrawRange(0, count);
+       pointCloud.visible = count > 0;
+     }
+
+     // Update human detection bounding box(es) and label(s).
+     // Accepts either a single detection object (legacy/cloud path) or an
+     // array of detections (live LAN clustering path, possibly multiple
+     // people at once).
+     function updateHumanDetection(det) {
+       const detections = det == null ? [] : (Array.isArray(det) ? det : [det]);
+       ensurePoolSize(detections.length);
+
+       for (let i = 0; i < boxPool.length; i++) {
+         if (i >= detections.length) {
+           boxPool[i].visible = false;
+           labelPool[i].visible = false;
+           continue;
+         }
+
+         const d = detections[i];
+         const box = boxPool[i];
+         const label = labelPool[i];
+
+         // Position bounding box center at (x, y, z).
+         // Y coordinate is vertical height from ground (center of box).
+         box.position.set(d.x, d.y, d.z);
+         box.scale.set(d.width, d.height, d.depth);
+         box.visible = true;
+
+         const color = getPostureColor(d.posture);
+         box.material.color.setRGB(color.r / 255, color.g / 255, color.b / 255);
+         label.material.map = labelTexture(`${d.id}: ${d.posture}`, color);
+         label.material.needsUpdate = true;
+         label.position.set(d.x, d.y + d.height / 2 + 0.3, d.z);
+         label.visible = true;
+       }
+     }
+
+     // Mirrors the WS2812 colors the firmware actually sets per posture
+     // (radar_detection_callback in fall_sense_x_main.c), so the box color
+     // here matches what the physical LED on the device shows.
+     function getPostureColor(p) {
+       switch (p.toUpperCase()) {
+         case 'STANDING': return {r:0,g:255,b:127};   // WS2812_COLOR_PARROT_GREEN
+         case 'SITTING': return {r:128,g:0,b:128};    // WS2812_COLOR_PURPLE
+         case 'LYING':
+         case 'SLEEPING': return {r:255,g:255,b:0};   // WS2812_COLOR_YELLOW
+         case 'FALL': return {r:255,g:0,b:0};         // WS2812_COLOR_RED
+         default: return {r:0,g:255,b:0};             // WS2812_COLOR_GREEN
+       }
+     }
+
+     function setRoomDimensions(l, w, h) {
+       roomLength = l; roomWidth = w; roomHeight = h;
+       createRoom();  // Rebuild room with new dimensions
+     }
+
+     window.updatePoints = updatePoints;
+     window.updateHumanDetection = updateHumanDetection;
+     window.setRoomDimensions = setRoomDimensions;
+     window.onThreeInitialized = null;
+
+     init();
+   </script>
+</body>
+</html>

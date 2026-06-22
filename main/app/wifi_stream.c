@@ -29,9 +29,49 @@ static SemaphoreHandle_t s_client_mutex;
 static int s_server_fd = -1;
 static TaskHandle_t s_accept_task_handle = NULL;
 static bool s_running = false;
-static EventGroupHandle_t s_wifi_event_group;
+static EventGroupHandle_t s_wifi_event_group = NULL;
+static esp_event_handler_instance_t s_wifi_event_handler_instance = 0;
+static esp_event_handler_instance_t s_ip_event_handler_instance = 0;
+static bool s_global_initialized = false;  // Track one-time global init (netif, event loop, mutex)
+static bool s_stream_initialized = false; // Track whether wifi_stream is fully initialized
+static bool s_wifi_driver_initialized = false;
+
+/* Client callbacks */
+static wifi_stream_client_cb_t s_on_client_connected = NULL;
+static wifi_stream_client_cb_t s_on_client_disconnected = NULL;
+static wifi_stream_ip_cb_t s_on_ip_obtained = NULL;
+static char s_device_ip[INET_ADDRSTRLEN] = {0};
 
 #define WIFI_CONNECTED_BIT BIT0
+
+static void destroy_default_wifi_netif(const char *ifkey)
+{
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(ifkey);
+    if (netif) {
+        esp_netif_destroy(netif);
+        ESP_LOGI(TAG, "Default WiFi netif destroyed: %s", ifkey);
+    }
+}
+
+static void destroy_default_wifi_netifs(void)
+{
+    destroy_default_wifi_netif("WIFI_STA_DEF");
+    destroy_default_wifi_netif("WIFI_AP_DEF");
+}
+
+static void create_default_wifi_sta_if_needed(void)
+{
+    if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
+        esp_netif_create_default_wifi_sta();
+    }
+}
+
+static void create_default_wifi_ap_if_needed(void)
+{
+    if (esp_netif_get_handle_from_ifkey("WIFI_AP_DEF") == NULL) {
+        esp_netif_create_default_wifi_ap();
+    }
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -41,11 +81,28 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         case WIFI_EVENT_AP_STACONNECTED: {
             wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
             ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d", MAC2STR(event->mac), event->aid);
+            if (s_on_client_connected != NULL) {
+                s_on_client_connected();
+            }
             break;
         }
         case WIFI_EVENT_AP_STADISCONNECTED: {
             wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
             ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d", MAC2STR(event->mac), event->aid);
+            if (s_on_client_disconnected != NULL) {
+                s_on_client_disconnected();
+            }
+            break;
+        }
+        case WIFI_EVENT_AP_START: {
+            ESP_LOGI(TAG, "AP mode started");
+            esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (netif) {
+                esp_netif_ip_info_t ip_info;
+                esp_netif_get_ip_info(netif, &ip_info);
+                ESP_LOGI(TAG, "AP IP Address: " IPSTR, IP2STR(&ip_info.ip));
+                snprintf(s_device_ip, sizeof(s_device_ip), IPSTR, IP2STR(&ip_info.ip));
+            }
             break;
         }
         case WIFI_EVENT_STA_START:
@@ -62,20 +119,30 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        /* Store IP string */
+        snprintf(s_device_ip, sizeof(s_device_ip), IPSTR, IP2STR(&event->ip_info.ip));
+
+        /* Call IP obtained callback if registered */
+        if (s_on_ip_obtained != NULL) {
+            s_on_ip_obtained(s_device_ip);
+        }
     }
 }
 
 static void wifi_init_ap(const wifi_stream_config_t *config)
 {
-    esp_netif_create_default_wifi_ap();
+    create_default_wifi_ap_if_needed();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    s_wifi_driver_initialized = true;
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
-                                                        NULL, NULL));
+                                                        NULL,
+                                                        &s_wifi_event_handler_instance));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 
@@ -102,19 +169,22 @@ static void wifi_init_ap(const wifi_stream_config_t *config)
 
 static void wifi_init_sta(const wifi_stream_config_t *config)
 {
-    esp_netif_create_default_wifi_sta();
+    create_default_wifi_sta_if_needed();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    s_wifi_driver_initialized = true;
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
-                                                        NULL, NULL));
+                                                        NULL,
+                                                        &s_wifi_event_handler_instance));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
                                                         &wifi_event_handler,
-                                                        NULL, NULL));
+                                                        NULL,
+                                                        &s_ip_event_handler_instance));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
@@ -125,16 +195,22 @@ static void wifi_init_sta(const wifi_stream_config_t *config)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT,
-                                           pdFALSE, pdTRUE,
-                                           pdMS_TO_TICKS(30000));
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to AP SSID:%s", config->ssid);
-    } else {
-        ESP_LOGE(TAG, "Failed to connect to AP SSID:%s", config->ssid);
+    /* Default modem-sleep power save ("wifi:pm start, type: 1" in the log)
+     * lets the radio sleep between beacon intervals to save power. That's
+     * fine for the small periodic Firebase pushes this device normally
+     * does, but it has caused the whole radio to go unresponsive for
+     * extended stretches during a sustained OTA download - timing out
+     * everything else (Firebase, DNS, even this device's own /ota_status
+     * endpoint) at the same time the download itself stalls. This is a
+     * mains-powered sensor, not a battery device, so there's no real
+     * power-saving benefit worth the reliability cost. */
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to disable WiFi power save: %s", esp_err_to_name(ps_err));
     }
+
+    ESP_LOGI(TAG, "WiFi STA started, connecting to SSID: %s", config->ssid);
+    // Connection will be handled asynchronously; no blocking wait
 }
 
 static void tcp_accept_task(void *arg)
@@ -179,8 +255,8 @@ static void tcp_accept_task(void *arg)
         FD_SET(s_server_fd, &read_fds);
 
         struct timeval timeout = {
-            .tv_sec = 1,
-            .tv_usec = 0,
+            .tv_sec = 0,
+            .tv_usec = 100000, // 100 ms
         };
 
         int sel = select(s_server_fd + 1, &read_fds, NULL, NULL, &timeout);
@@ -190,6 +266,10 @@ static void tcp_accept_task(void *arg)
         }
         if (sel == 0) {
             continue;
+        }
+        // Check if still running before accepting (may have been stopped during select)
+        if (!s_running) {
+            break;
         }
 
         struct sockaddr_in client_addr;
@@ -235,21 +315,28 @@ esp_err_t wifi_stream_init(const wifi_stream_config_t *config)
         s_client_ips[i][0] = '\0';
     }
 
-    s_client_mutex = xSemaphoreCreateMutex();
-    if (s_client_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex");
-        return ESP_FAIL;
+    /* Store client callbacks */
+    if (config->on_client_connected != NULL) {
+        s_on_client_connected = config->on_client_connected;
+    }
+    if (config->on_client_disconnected != NULL) {
+        s_on_client_disconnected = config->on_client_disconnected;
+    }
+    if (config->on_ip_obtained != NULL) {
+        s_on_ip_obtained = config->on_ip_obtained;
     }
 
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    // One-time global initializations (netif, event loop, and mutex)
+    if (!s_global_initialized) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        s_client_mutex = xSemaphoreCreateMutex();
+        if (s_client_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create mutex");
+            return ESP_FAIL;
+        }
+        s_global_initialized = true;
     }
-    ESP_ERROR_CHECK(ret);
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     s_wifi_event_group = xEventGroupCreate();
 
@@ -261,15 +348,25 @@ esp_err_t wifi_stream_init(const wifi_stream_config_t *config)
 
     s_running = true;
 
-    xTaskCreate(tcp_accept_task, "tcp_accept", 4096,
+    BaseType_t task_ret = xTaskCreate(tcp_accept_task, "tcp_accept", 4096,
                 (void *)(uintptr_t)config->port, 5, &s_accept_task_handle);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create TCP accept task");
+        s_running = false;
+        return ESP_FAIL;
+    }
 
+    s_stream_initialized = true;
     ESP_LOGI(TAG, "WiFi stream server started on port %d", config->port);
     return ESP_OK;
 }
 
 esp_err_t wifi_stream_send(const char *data, size_t len)
 {
+    if (!s_running || s_client_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
     for (int i = 0; i < WIFI_STREAM_MAX_CLIENTS; i++) {
         if (s_clients[i] >= 0) {
@@ -290,40 +387,58 @@ void wifi_stream_deinit(void)
 {
     s_running = false;
 
-    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-    for (int i = 0; i < WIFI_STREAM_MAX_CLIENTS; i++) {
-        if (s_clients[i] >= 0) {
-            close(s_clients[i]);
-            s_clients[i] = -1;
-            s_client_ips[i][0] = '\0';
-        }
-    }
-    xSemaphoreGive(s_client_mutex);
-
-    if (s_server_fd >= 0) {
-        close(s_server_fd);
-        s_server_fd = -1;
-    }
-
+    // Wait for accept task to exit (it will close its server socket and delete itself)
     if (s_accept_task_handle != NULL) {
-        xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(3000));
+        // Task checks s_running every 100ms (select timeout), so wait a bit longer
+        vTaskDelay(pdMS_TO_TICKS(300));
         s_accept_task_handle = NULL;
     }
 
+    // Close any remaining client sockets (task is gone)
     if (s_client_mutex != NULL) {
-        vSemaphoreDelete(s_client_mutex);
-        s_client_mutex = NULL;
+        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+        for (int i = 0; i < WIFI_STREAM_MAX_CLIENTS; i++) {
+            if (s_clients[i] >= 0) {
+                close(s_clients[i]);
+                s_clients[i] = -1;
+                s_client_ips[i][0] = '\0';
+            }
+        }
+        xSemaphoreGive(s_client_mutex);
     }
 
-    esp_wifi_stop();
-    esp_wifi_deinit();
+    // Unregister event handlers
+    if (s_wifi_event_handler_instance) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_event_handler_instance);
+        s_wifi_event_handler_instance = 0;
+    }
+    if (s_ip_event_handler_instance) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_ip_event_handler_instance);
+        s_ip_event_handler_instance = 0;
+    }
 
+    // Delete event group
+    if (s_wifi_event_group != NULL) {
+        vEventGroupDelete(s_wifi_event_group);
+        s_wifi_event_group = NULL;
+    }
+
+    if (s_wifi_driver_initialized) {
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        s_wifi_driver_initialized = false;
+    }
+
+    s_device_ip[0] = '\0';
+    destroy_default_wifi_netifs();
+
+    s_stream_initialized = false;
     ESP_LOGI(TAG, "WiFi stream deinitialized");
 }
 
 const char *wifi_stream_get_client_ip(void)
 {
-    if (s_client_mutex == NULL) return NULL;
+    if (!s_running || s_client_mutex == NULL) return NULL;
 
     const char *ip = NULL;
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
@@ -335,4 +450,22 @@ const char *wifi_stream_get_client_ip(void)
     }
     xSemaphoreGive(s_client_mutex);
     return ip;
+}
+
+const char *wifi_stream_get_device_ip(void)
+{
+    if (s_device_ip[0] == '\0') {
+        return NULL;
+    }
+    return s_device_ip;
+}
+
+bool wifi_stream_is_connected(void)
+{
+    // Consider connected if device has obtained a STA IP address
+    // This works for STA mode and AP+STA mode
+    if (!s_running || s_device_ip[0] == '\0') {
+        return false;
+    }
+    return true;
 }

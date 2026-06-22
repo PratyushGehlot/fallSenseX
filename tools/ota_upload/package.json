@@ -1,0 +1,9 @@
+{
+  "name": "fallsensex-ota-upload",
+  "description": "Dev tool: push a firmware .bin to Firebase Storage to trigger the OTA manifest pipeline",
+  "private": true,
+  "main": "upload_firmware.js",
+  "dependencies": {
+    "firebase-admin": "^11.11.0"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "commands": [
+    {
+      "command": "AT+BAUD",
+      "description": "Set baud rate",
+      "expected": "OK",
+      "delay": 100
+    },
+    {
+      "command": "AT+START",
+      "description": "Start radar",
+      "expected": "OK",
+      "delay": 100
+    },
+    {
+      "command": "AT+STOP",
+      "description": "Stop radar",
+      "expected": "OK",
+      "delay": 100
+    }
+  ]
+}

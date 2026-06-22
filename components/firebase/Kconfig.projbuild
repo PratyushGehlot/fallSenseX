@@ -1,0 +1,59 @@
+menu "Firebase Configuration"
+
+    config Firebase_ENABLED
+        bool "Enable Firebase Integration"
+        default y
+        help
+            Enable Firebase cloud integration for pushing frame data
+
+    config Firebase_DATABASE_URL
+        string "Firebase Realtime Database URL"
+        default ""
+        depends on Firebase_ENABLED
+        help
+            Enter your Firebase Realtime Database URL
+            Example: https://your-project.firebaseio.com
+
+    config Firebase_AUTH_TOKEN
+        string "Firebase Auth Token (optional)"
+        default ""
+        depends on Firebase_ENABLED
+        help
+            Firebase authentication token for database access
+
+    config Firebase_DEVICE_ID
+        string "Device ID"
+        default "FallSenseX_01"
+        depends on Firebase_ENABLED
+        help
+            Unique identifier for this device
+
+    config Firebase_PUSH_INTERVAL_MS
+        int "Push interval (milliseconds)"
+        default 1000
+        depends on Firebase_ENABLED
+        help
+            Interval between Firebase pushes in milliseconds
+
+    config Firebase_MAX_RETRY
+        int "Max retry attempts"
+        default 3
+        depends on Firebase_ENABLED
+        help
+            Maximum retry attempts for failed Firebase pushes
+
+    config Firebase_ENABLE_TEMPERATURE
+        bool "Enable Temperature Reporting"
+        default y
+        depends on Firebase_ENABLED
+        help
+            Enable periodic CPU temperature reporting to Firebase
+
+    config Firebase_ENABLE_RESET_CMD
+        bool "Enable Reset Command Functionality"
+        default y
+        depends on Firebase_ENABLED
+        help
+            Enable device reset via Firebase commands
+
+endmenu

@@ -1,0 +1,84 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": "auth != null && auth.uid == $uid"
+      },
+      ".indexOn": ["email"]
+    },
+    "devices": {
+      ".read": "auth != null",
+      "$deviceId": {
+        ".write": "auth != null && (
+                      !data.exists() && 
+                      newData.child('ownerId').isString() && 
+                      newData.child('ownerId').val() == auth.uid
+                    ) || (
+                      data.exists() && 
+                      data.child('ownerId').isString() && 
+                      data.child('ownerId').val() == auth.uid
+                    )",
+        "frames": {
+          ".read": "auth != null && (
+                      data.parent().child('ownerId').isString() &&
+                      data.parent().child('ownerId').val() == auth.uid
+                    ) || (
+                      data.parent().child('sharedWith').hasChild(auth.uid) &&
+                      data.parent().child('sharedWith').child(auth.uid).val() === true
+                    )",
+          ".write": "auth != null && (
+                      data.parent().child('ownerId').isString() &&
+                      data.parent().child('ownerId').val() == auth.uid
+                    )",
+          ".indexOn": ["timestamp"]
+        },
+        "online": {
+          ".read": "auth != null && (
+                      data.parent().child('ownerId').isString() &&
+                      data.parent().child('ownerId').val() == auth.uid
+                    ) || (
+                      data.parent().child('sharedWith').hasChild(auth.uid) &&
+                      data.parent().child('sharedWith').child(auth.uid).val() === true
+                    )",
+          ".write": "auth != null && (
+                      data.parent().child('ownerId').isString() &&
+                      data.parent().child('ownerId').val() == auth.uid
+                    )"
+        },
+        "info": {
+          ".read": "auth != null && (
+                      data.parent().child('ownerId').isString() &&
+                      data.parent().child('ownerId').val() == auth.uid
+                    ) || (
+                      data.parent().child('sharedWith').hasChild(auth.uid) &&
+                      data.parent().child('sharedWith').child(auth.uid).val() === true
+                    )",
+          ".write": "auth != null && (
+                      data.parent().child('ownerId').isString() &&
+                      data.parent().child('ownerId').val() == auth.uid
+                    )"
+        },
+        "sharedWith": {
+          ".write": "auth != null && 
+                     data.parent().child('ownerId').isString() && 
+                     data.parent().child('ownerId').val() == auth.uid",
+          ".validate": "newData.isBoolean()"
+        }
+      }
+    },
+    "invites": {
+      ".read": "auth != null",
+      "$code": {
+        ".write": "auth != null && !data.exists() && 
+                   newData.hasChildren(['deviceId', 'ownerUid', 'createdAt']) &&
+                   newData.child('deviceId').isString() &&
+                   newData.child('ownerUid').isString() &&
+                   newData.child('createdAt').isNumber() &&
+                   root.child('devices').child(newData.child('deviceId').val()).child('ownerId').isString() &&
+                   root.child('devices').child(newData.child('deviceId').val()).child('ownerId').val() == auth.uid",
+        ".validate": "$code.matches(/^[A-Z0-9]{6}$/)"
+      }
+    }
+  }
+}

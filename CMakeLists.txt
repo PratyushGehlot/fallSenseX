@@ -13,4 +13,4 @@ add_compile_options(-fdiagnostics-color=always
                     -Wno-deprecated-declarations
                     -Wno-unused-but-set-variable)
 
-project(radar_human_detectmon)
+project(fall_sense_x)

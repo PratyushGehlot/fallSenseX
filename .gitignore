@@ -61,6 +61,10 @@ venv/
 .venv/
 env/
 
+# Node.js (tools/ota_upload, Cloud Functions, etc.)
+node_modules/
+npm-debug.log*
+
 # Language Servers
 .clangd/
 .ccls-cache/
@@ -76,3 +80,41 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Compiled binaries / device artifacts
+*.pyd
+*.log
+esp32s3log.txt
+
+# IDE project metadata
+.idea/
+*.iml
+
+# Flutter / Dart (fall_sense_x_mobile)
+fall_sense_x_mobile/.dart_tool/
+fall_sense_x_mobile/build/
+fall_sense_x_mobile/.flutter-plugins-dependencies
+fall_sense_x_mobile/.flutter-plugins
+
+# Android
+fall_sense_x_mobile/android/.gradle/
+fall_sense_x_mobile/android/.kotlin/
+fall_sense_x_mobile/android/local.properties
+fall_sense_x_mobile/android/**/build/
+
+# iOS / macOS / Linux / Windows Flutter build outputs
+fall_sense_x_mobile/ios/Pods/
+fall_sense_x_mobile/ios/.symlinks/
+fall_sense_x_mobile/ios/Flutter/Flutter.framework
+fall_sense_x_mobile/ios/Flutter/Flutter.podspec
+
+# Firebase functions
+fall_sense_x_mobile/functions/node_modules/
+fall_sense_x_mobile/functions/venv/
+
+# ESP-IDF managed components (re-fetched by component manager)
+managed_components/
+
+# Other build dirs
+tools/radar_uart_debug/build/
+tools/pc_app_code/build_src/
