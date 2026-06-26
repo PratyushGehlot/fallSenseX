@@ -43,43 +43,9 @@ class _Room3DViewState extends State<Room3DView> {
     if (widget.framesRef == null) return;
 
     _subscription = widget.framesRef!.onValue.listen((DatabaseEvent event) {
-      final data = event.snapshot.value;
-      if (data == null) {
-        if (mounted) setState(() => _applyFrame(null));
-        return;
-      }
-
-      Map<String, dynamic>? latest;
-      if (data is Map) {
-        int latestTime = -1;
-        data.forEach((key, value) {
-          if (value is! Map) return;
-          final frame = Map<String, dynamic>.from(value);
-          frame['id'] = key.toString();
-          final t = _frameTimestampMs(frame);
-          if (t >= latestTime) {
-            latestTime = t;
-            latest = frame;
-          }
-        });
-      }
-
+      final latest = latestFrameFromSnapshot(event.snapshot.value);
       if (mounted) setState(() => _applyFrame(latest));
     });
-  }
-
-  int _frameTimestampMs(Map<String, dynamic> frame) {
-    if (frame['timestamp'] != null) {
-      int ms = (frame['timestamp'] as num).toInt() * 1000;
-      if (frame['timestamp_ms'] != null) {
-        ms += (frame['timestamp_ms'] as num).toInt();
-      }
-      return ms;
-    }
-    if (frame['timestamp_ms'] != null) {
-      return (frame['timestamp_ms'] as num).toInt();
-    }
-    return DateTime.now().millisecondsSinceEpoch;
   }
 
   void _applyFrame(Map<String, dynamic>? frameMap) {
@@ -90,45 +56,30 @@ class _Room3DViewState extends State<Room3DView> {
     }
 
     final present = frameMap['present'] as bool? ?? false;
-    final timestampMs = _frameTimestampMs(frameMap);
+    final timestampMs = frameTimestampMs(frameMap);
     final now = DateTime.now().millisecondsSinceEpoch;
     final isDataFresh = (now - timestampMs) < 86400000;
 
-    HumanDetection humanDet;
+    List<HumanDetection> detections = const [];
     if (present && isDataFresh) {
-      final xMeters = (frameMap['x'] as num?)?.toDouble() ?? 0.0;
-      final yMeters = (frameMap['y'] as num?)?.toDouble() ?? 0.0;
-      final zMeters = (frameMap['z'] as num?)?.toDouble() ?? 0.0;
-      final posture = frameMap['posture']?.toString() ?? 'UNKNOWN';
-      final confidence = (frameMap['confidence'] as num?)?.toDouble() ?? 1.0;
-      final velocity = (frameMap['velocity'] as num?)?.toDouble() ?? 0.0;
-
       // Convert meters (sensor-centered) to centered feet for drawing.
-      humanDet = HumanDetection(
-        id: 'H1',
-        x: xMeters * 3.28084,
-        y: yMeters * 3.28084,
-        z: zMeters * 3.28084,
-        posture: posture,
-        confidence: confidence,
-        velocity: velocity,
-      );
-    } else {
-      humanDet = HumanDetection(
-        id: 'H1',
-        x: 0.0,
-        y: 0.0,
-        z: 0.0,
-        posture: 'NO_PRESENCE',
-        confidence: 0.0,
-        velocity: 0.0,
-      );
+      detections = humanDetectionsFromFrameMap(frameMap)
+          .map((d) => HumanDetection(
+                id: d.id,
+                x: d.x * 3.28084,
+                y: d.y * 3.28084,
+                z: d.z * 3.28084,
+                posture: d.posture,
+                confidence: d.confidence,
+                velocity: d.velocity,
+              ))
+          .toList();
     }
 
     _currentRadarFrame = RadarFrame(
       timestamp: timestampMs,
       points: const [],
-      humanDetection: humanDet,
+      detections: detections,
     );
   }
 
@@ -148,8 +99,8 @@ class _Room3DViewState extends State<Room3DView> {
 
   @override
   Widget build(BuildContext context) {
-    final human = _currentRadarFrame?.humanDetection;
-    final showInfoBar = human != null && human.posture != 'NO_PRESENCE';
+    final detections = _currentRadarFrame?.detections ?? const [];
+    final showInfoBar = detections.isNotEmpty;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -204,17 +155,27 @@ class _Room3DViewState extends State<Room3DView> {
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: Colors.cyan.withOpacity(0.4)),
                     ),
-                    child: Wrap(
-                      spacing: 20,
-                      runSpacing: 8,
-                      alignment: WrapAlignment.center,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        _buildInfoChip('Posture', human.posture, Icons.accessibility_new),
-                        _buildInfoChip('X', '${human.x.toStringAsFixed(1)} ft', Icons.straighten),
-                        _buildInfoChip('Y', '${human.y.toStringAsFixed(1)} ft', Icons.straighten),
-                        _buildInfoChip('Z', '${human.z.toStringAsFixed(1)} ft', Icons.height),
-                        _buildInfoChip('Vel', '${human.velocity.toStringAsFixed(2)} m/s', Icons.speed),
-                        _buildInfoChip('Conf', '${(human.confidence * 100).toStringAsFixed(0)}%', Icons.check_circle),
+                        for (final human in detections)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Wrap(
+                              spacing: 20,
+                              runSpacing: 8,
+                              alignment: WrapAlignment.center,
+                              children: [
+                                _buildInfoChip('#', human.id, Icons.tag),
+                                _buildInfoChip('Posture', human.posture, Icons.accessibility_new),
+                                _buildInfoChip('X', '${human.x.toStringAsFixed(1)} ft', Icons.straighten),
+                                _buildInfoChip('Y', '${human.y.toStringAsFixed(1)} ft', Icons.straighten),
+                                _buildInfoChip('Z', '${human.z.toStringAsFixed(1)} ft', Icons.height),
+                                _buildInfoChip('Vel', '${human.velocity.toStringAsFixed(2)} m/s', Icons.speed),
+                                _buildInfoChip('Conf', '${(human.confidence * 100).toStringAsFixed(0)}%', Icons.check_circle),
+                              ],
+                            ),
+                          ),
                       ],
                     ),
                   ),
@@ -327,18 +288,16 @@ class RoomPainter extends CustomPainter {
     final Paint sensorPaint = Paint()..color = Colors.white.withOpacity(0.7);
     canvas.drawCircle(Offset(centerCanvasX, centerCanvasY), 4, sensorPaint);
 
-    if (frame.humanDetection != null) {
-      final human = frame.humanDetection!;
+    if (frame.detections.isEmpty) {
+      _drawLabel(canvas, 'No human present', Offset(centerCanvasX, centerCanvasY + 24), Colors.grey);
+      return;
+    }
 
+    for (final human in frame.detections) {
       // Coordinates are centered feet (sensor at 0,0). Grid center is (0,0).
       // +X right, +Y up. Canvas Y increases downward, so flip Y.
       double canvasX = centerCanvasX + human.x * scale;
       double canvasY = centerCanvasY - human.y * scale;
-
-      if (human.posture.toUpperCase() == 'NO_PRESENCE') {
-        _drawLabel(canvas, 'No human present', Offset(centerCanvasX, centerCanvasY + 24), Colors.grey);
-        return;
-      }
 
       final rgb = postureColorRgb(human.posture);
       final color = Color.fromARGB(255, rgb[0], rgb[1], rgb[2]);

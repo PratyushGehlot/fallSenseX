@@ -8,10 +8,56 @@
     body { margin: 0; padding: 0; overflow: hidden; background: #000; touch-action: none; }
     #container { width: 100vw; height: 100vh; }
     canvas { display: block; }
+
+    /* Room-axis compass (not true magnetic north - there's no magnetometer
+     * in this pipeline; it's a fixed reference tied to the room's own X/Z
+     * axes so the user can keep their bearings while orbiting the scene).
+     * The ring rotates opposite to the camera's azimuth each frame so its
+     * N/E/S/W labels always show where those directions actually are
+     * relative to the current view. */
+    #compass {
+      /* Pushed down below the Flutter status bar (IP field/refresh button)
+       * that overlays the top of the screen in live mode - otherwise the
+       * two visually overlap in the top-right corner. */
+      position: absolute; top: 64px; right: 16px;
+      width: 64px; height: 64px;
+      pointer-events: none;
+    }
+    #compass-bg {
+      position: absolute; width: 100%; height: 100%;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.35);
+    }
+    #compass-rose {
+      position: absolute; width: 100%; height: 100%;
+      transition: transform 0.05s linear;
+    }
+    #compass-rose .dir {
+      position: absolute;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      font-weight: bold;
+      text-shadow: 0 0 3px rgba(0,0,0,0.9);
+    }
+    #compass-rose .n { top: 2px; left: 50%; transform: translateX(-50%); color: #ff5555; }
+    #compass-rose .s { bottom: 2px; left: 50%; transform: translateX(-50%); }
+    #compass-rose .e { right: 4px; top: 50%; transform: translateY(-50%); }
+    #compass-rose .w { left: 4px; top: 50%; transform: translateY(-50%); }
   </style>
 </head>
 <body>
   <div id="container"></div>
+  <div id="compass">
+    <div id="compass-bg"></div>
+    <div id="compass-rose">
+      <span class="dir n">N</span>
+      <span class="dir e">E</span>
+      <span class="dir s">S</span>
+      <span class="dir w">W</span>
+    </div>
+  </div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <script>
@@ -19,8 +65,59 @@
      let pointCloud;
      let boxPool = [];   // pooled bounding boxes, reused across frames
      let labelPool = []; // pooled labels, parallel to boxPool
-     let roomOutline, sensorBox;
+     let roomOutline, sensorBox, scaleGroup;
      let roomLength = 6, roomWidth = 6, roomHeight = 2.5;  // Default to radar coverage area (meters)
+     const METERS_PER_FOOT = 0.3048;
+
+     // 1-foot tick marks + labels along the three room edges meeting at the
+     // origin corner (length along X, height along Y, width along Z).
+     // Independent of roomOutline's centered position - these are placed
+     // directly in world space spanning 0..roomLength/Height/Width, which is
+     // where the room visually sits regardless of how the box geometry
+     // itself is centered locally.
+     function createRoomScale() {
+       if (scaleGroup) { scene.remove(scaleGroup); scaleGroup = null; }
+       scaleGroup = new THREE.Group();
+
+       const tickMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 });
+       const tickLen = 0.06;
+
+       function addAxisTicks(axis, totalMeters) {
+         const totalFeet = Math.floor(totalMeters / METERS_PER_FOOT);
+         for (let ft = 1; ft <= totalFeet; ft++) {
+           const m = ft * METERS_PER_FOOT;
+           let p1, p2, labelPos;
+           if (axis === 'x') {
+             p1 = new THREE.Vector3(m, 0, 0);
+             p2 = new THREE.Vector3(m, tickLen, 0);
+             labelPos = new THREE.Vector3(m, tickLen + 0.14, 0);
+           } else if (axis === 'y') {
+             p1 = new THREE.Vector3(0, m, 0);
+             p2 = new THREE.Vector3(tickLen, m, 0);
+             labelPos = new THREE.Vector3(tickLen + 0.18, m, 0);
+           } else {
+             p1 = new THREE.Vector3(0, 0, m);
+             p2 = new THREE.Vector3(0, tickLen, m);
+             labelPos = new THREE.Vector3(0, tickLen + 0.14, m);
+           }
+
+           const geom = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+           scaleGroup.add(new THREE.Line(geom, tickMat));
+
+           const tex = plainLabelTexture(`${ft}ft`);
+           const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.85 }));
+           sprite.scale.set(0.45, 0.11, 1);
+           sprite.position.copy(labelPos);
+           scaleGroup.add(sprite);
+         }
+       }
+
+       addAxisTicks('x', roomLength);
+       addAxisTicks('y', roomHeight);
+       addAxisTicks('z', roomWidth);
+
+       scene.add(scaleGroup);
+     }
 
      function createRoom() {
        // Remove existing room geometry if present
@@ -45,6 +142,8 @@
        sensorBox = new THREE.Mesh(sensorGeom, sensorMat);
        sensorBox.position.set(roomLength / 2, roomHeight - sensorSize * 0.3, roomWidth / 2);
        scene.add(sensorBox);
+
+       createRoomScale();
 
        // Update camera to view the room nicely
        const target = new THREE.Vector3(roomLength / 2, roomHeight / 2, roomWidth / 2);
@@ -142,15 +241,46 @@
        return new THREE.CanvasTexture(canvas);
      }
 
+     // Plain text, no background box - used for the room-scale tick labels,
+     // which sit right next to thin tick lines and look cleaner as bare
+     // numbers instead of little floating cards.
+     function plainLabelTexture(text) {
+       const canvas = document.createElement('canvas');
+       const ctx = canvas.getContext('2d');
+       canvas.width = 512; canvas.height = 128;
+       ctx.fillStyle = 'white'; ctx.font = 'bold 32px Arial'; ctx.textAlign = 'center';
+       ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 6;
+       ctx.fillText(text, 256, 80);
+       return new THREE.CanvasTexture(canvas);
+     }
+
      function onResize() {
        camera.aspect = window.innerWidth / window.innerHeight;
        camera.updateProjectionMatrix();
        renderer.setSize(window.innerWidth, window.innerHeight);
      }
 
+     let compassRoseEl = null;
+
+     // Rotates the compass ring opposite to the camera's azimuth so its
+     // N/E/S/W labels stay aligned with the room's fixed +Z/+X axes as seen
+     // from the current view (not true magnetic north - this device has no
+     // magnetometer; it's a room-relative orientation reference only).
+     function updateCompass() {
+       if (!compassRoseEl) {
+         compassRoseEl = document.getElementById('compass-rose');
+         if (!compassRoseEl) return;
+       }
+       const dx = camera.position.x - controls.target.x;
+       const dz = camera.position.z - controls.target.z;
+       const azimuthDeg = THREE.MathUtils.radToDeg(Math.atan2(dx, dz));
+       compassRoseEl.style.transform = `rotate(${-azimuthDeg}deg)`;
+     }
+
      function animate() {
        requestAnimationFrame(animate);
        controls.update();
+       updateCompass();
        renderer.render(scene, camera);
      }
 

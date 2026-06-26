@@ -20,6 +20,8 @@
 #include "esp_crt_bundle.h"
 #include "driver/temperature_sensor.h"  // Temperature sensor include
 #include "cJSON.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
 
 #include "firebase.h"
 
@@ -53,6 +55,9 @@ static uint32_t s_frame_counter = 0;
 /* Buffer for Firebase JSON payload */
 #define FIREBASE_JSON_SIZE 512
 #define FIREBASE_URL_PATH_SIZE 512
+/* Header fields (~150B) + up to FIREBASE_MAX_TARGETS entries (~110B each) +
+ * margin. Stack-allocated per push - see push_frame_to_firebase. */
+#define FIREBASE_MULTI_TARGET_JSON_SIZE (256 + FIREBASE_MAX_TARGETS * 128)
 
 /* Forward declaration for static function */
 static esp_err_t firebase_get_command(const char *command_path, char *value_buf, size_t buf_size);
@@ -96,6 +101,29 @@ static void get_timestamp(uint32_t *sec, uint32_t *ms)
     gettimeofday(&tv, NULL);
     if (sec) *sec = (uint32_t)tv.tv_sec;
     if (ms) *ms = (uint32_t)(tv.tv_usec / 1000);
+}
+
+/* Diagnostic snapshot logged around connection failures, to tell apart
+ * heap pressure, weak WiFi, and DNS/server-side issues without having to
+ * guess from "Failed to open new connection" alone. minimum_free is the
+ * lowest free-heap value ever observed since boot - if it's gotten close
+ * to free_now repeatedly, that's a stronger fragmentation signal than
+ * free_now alone. RSSI requires the STA to currently be associated; -127
+ * is logged if esp_wifi_sta_get_ap_info fails (e.g. briefly disconnected/
+ * reconnecting), which is itself diagnostic. */
+static void log_network_diagnostics(const char *context)
+{
+    uint32_t free_now = esp_get_free_heap_size();
+    uint32_t min_ever = esp_get_minimum_free_heap_size();
+
+    wifi_ap_record_t ap_info;
+    int8_t rssi = -127;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = ap_info.rssi;
+    }
+
+    ESP_LOGW(TAG, "[%s] diagnostics: free_heap=%lu min_free_heap_ever=%lu wifi_rssi=%d dBm",
+             context, (unsigned long)free_now, (unsigned long)min_ever, (int)rssi);
 }
 
 /* Generate human-readable frame ID from timestamp + counter:
@@ -152,7 +180,6 @@ static esp_err_t push_frame_to_firebase(const firebase_frame_t *frame)
 
     char url_path[FIREBASE_URL_PATH_SIZE];
     char frame_id[32];
-    char json_payload[FIREBASE_JSON_SIZE];
 
     /* Generate or use provided frame ID */
     if (frame->frame_id != NULL && strlen(frame->frame_id) > 0) {
@@ -163,39 +190,54 @@ static esp_err_t push_frame_to_firebase(const firebase_frame_t *frame)
         generate_frame_id(frame_id, sizeof(frame_id), frame->timestamp, frame->timestamp_ms);
     }
 
-    /* Build JSON payload */
-    int json_len = snprintf(json_payload, sizeof(json_payload),
+    /* Build JSON payload by hand (no cJSON tree) - a long-running device
+     * pushing frames every few hundred ms can't afford the 50-100+ small
+     * heap allocations a cJSON tree costs per multi-target frame (one
+     * malloc per node plus one per duplicated key); that heap churn was
+     * implicated in intermittent esp-tls connection failures under sustained
+     * load. "targets" is a map keyed by track_id (not a JSON array) so each
+     * person's entry can be updated/merged independently and so the app can
+     * use track_id as a stable widget key across frames. */
+    char json_payload[FIREBASE_MULTI_TARGET_JSON_SIZE];
+    int off = snprintf(json_payload, sizeof(json_payload),
         "{"
         "\"timestamp\":%lu,"
         "\"timestamp_ms\":%lu,"
         "\"device_id\":\"%s\","
-        "\"x\":%.2f,"
-        "\"y\":%.2f,"
-        "\"z\":%.2f,"
-        "\"velocity\":%.3f,"
-        "\"posture\":\"%s\","
-        "\"confidence\":%.2f,"
         "\"present\":%s,"
-        "\"temperature\":%.1f"
-        "}",
+        "\"temperature\":%.1f,"
+        "\"targets\":{",
         frame->timestamp,
         frame->timestamp_ms,
         s_firebase.device_id,
-        frame->x,
-        frame->y,
-        frame->z,
-        frame->velocity,
-        posture_to_string(frame->posture),
-        frame->confidence,
         frame->present ? "true" : "false",
-        frame->temperature
-    );
+        frame->temperature);
 
-    if (json_len <= 0 || json_len >= sizeof(json_payload)) {
-        ESP_LOGE(TAG, "Failed to build JSON payload");
+    int n = frame->target_count;
+    if (n > FIREBASE_MAX_TARGETS) {
+        n = FIREBASE_MAX_TARGETS;
+    }
+    for (int i = 0; i < n && off > 0 && off < sizeof(json_payload); i++) {
+        const firebase_target_t *t = &frame->targets[i];
+        off += snprintf(json_payload + off, sizeof(json_payload) - off,
+            "%s\"%u\":{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"velocity\":%.3f,\"posture\":\"%s\",\"confidence\":%.2f}",
+            i > 0 ? "," : "",
+            (unsigned)t->track_id,
+            t->x, t->y, t->z, t->velocity,
+            posture_to_string(t->posture),
+            t->confidence);
+    }
+    if (off > 0 && off < sizeof(json_payload)) {
+        off += snprintf(json_payload + off, sizeof(json_payload) - off, "}}");
+    }
+
+    if (off <= 0 || off >= sizeof(json_payload)) {
+        ESP_LOGE(TAG, "Failed to build JSON payload (would overflow %d-byte buffer)",
+                 (int)sizeof(json_payload));
         xSemaphoreGive(s_http_mutex);
         return ESP_ERR_NO_MEM;
     }
+    int json_len = off;
 
     /* Build URL with custom frame ID - use PUT to set specific key */
     if (s_firebase.auth_token[0] != '\0') {
@@ -215,12 +257,17 @@ static esp_err_t push_frame_to_firebase(const firebase_frame_t *frame)
         );
     }
 
-    /* Configure HTTP client - use PUT for custom key */
+    /* Configure HTTP client - use PUT for custom key.
+     * timeout_ms: frame pushes are small, frequent, heartbeat-style data -
+     * if Firebase doesn't respond in 5s it's not about to, and a tighter
+     * timeout caps how long one stuck attempt can block the push task
+     * (and therefore back up s_firebase_queue) before firebase_push_frame's
+     * retry loop in firebase_push_frame() gives up and moves on. */
     esp_http_client_config_t config = {
         .url = url_path,
         .method = HTTP_METHOD_PUT,
         .event_handler = http_event_handler,
-        .timeout_ms = 15000,
+        .timeout_ms = 5000,
         .buffer_size = 1024,
         .crt_bundle_attach = esp_crt_bundle_attach,  // Use built-in CA root certificates for HTTPS
     };
@@ -254,6 +301,7 @@ static esp_err_t push_frame_to_firebase(const firebase_frame_t *frame)
         }
     } else {
         ESP_LOGE(TAG, "HTTP POST request failed: %s", esp_err_to_name(err));
+        log_network_diagnostics("push_frame");
     }
 
     esp_http_client_cleanup(client);
@@ -592,6 +640,88 @@ esp_err_t firebase_post_heartbeat(uint32_t timestamp, uint32_t timestamp_ms)
     return err;
 }
 
+esp_err_t firebase_post_device_pin(const char *pin)
+{
+    if (!s_firebase.initialized || !s_firebase.enabled) {
+        ESP_LOGE(TAG, "Firebase not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (pin == NULL || pin[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_http_mutex == NULL || xSemaphoreTake(s_http_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to lock Firebase HTTP mutex");
+        return ESP_FAIL;
+    }
+
+    /* Read access on this path is owner-only (not shared viewers) - see
+     * firebase_rules.json's "secrets" node under devices/$deviceId. */
+    char url_path[FIREBASE_URL_PATH_SIZE];
+    if (s_firebase.auth_token[0] != '\0') {
+        snprintf(url_path, sizeof(url_path),
+                 "%s/devices/%s/secrets/pin.json?auth=%s",
+                 s_firebase.database_url,
+                 s_firebase.device_id,
+                 s_firebase.auth_token);
+    } else {
+        snprintf(url_path, sizeof(url_path),
+                 "%s/devices/%s/secrets/pin.json",
+                 s_firebase.database_url,
+                 s_firebase.device_id);
+    }
+
+    uint32_t sec, ms;
+    get_timestamp(&sec, &ms);
+    char json_payload[96];
+    int json_len = snprintf(json_payload, sizeof(json_payload),
+        "{\"value\":\"%s\",\"setAt\":%lu}",
+        pin, sec);
+
+    if (json_len <= 0 || json_len >= sizeof(json_payload)) {
+        ESP_LOGE(TAG, "Failed to build device-pin JSON payload");
+        xSemaphoreGive(s_http_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url_path,
+        .method = HTTP_METHOD_PUT,
+        .event_handler = http_event_handler,
+        .timeout_ms = 10000,
+        .buffer_size = 512,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize device-pin HTTP client");
+        xSemaphoreGive(s_http_mutex);
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, json_payload, json_len);
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        if (status_code == 200 || status_code == 201) {
+            ESP_LOGI(TAG, "Device PIN synced to Firebase");
+            err = ESP_OK;
+        } else {
+            ESP_LOGW(TAG, "Device-pin sync HTTP status = %d", status_code);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGW(TAG, "Device-pin sync request failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    xSemaphoreGive(s_http_mutex);
+    return err;
+}
+
 /* Read CPU temperature using ESP-IDF temperature sensor API */
 float firebase_read_cpu_temperature(void) {
     static temperature_sensor_handle_t tsens_handle = NULL;
@@ -724,11 +854,13 @@ esp_err_t firebase_trim_frames(int max_frames)
         return ESP_FAIL;
     }
 
-    /* Shallow + key-ordered GET: returns {"key1":true,"key2":true,...} in
-     * ascending (chronological) key order without fetching frame bodies. */
+    /* Firebase RTDB rejects shallow=true combined with any query parameter
+     * (orderBy/limitToFirst/etc - returns 400), so this can't be done in one
+     * request. Step 1: a plain shallow GET (no orderBy) just to get the
+     * total count cheaply, without fetching frame bodies. */
     char url_path[FIREBASE_URL_PATH_SIZE];
     snprintf(url_path, sizeof(url_path),
-             "%s/devices/%s/frames.json?shallow=true&orderBy=%%22$key%%22",
+             "%s/devices/%s/frames.json?shallow=true",
              s_firebase.database_url,
              s_firebase.device_id);
 
@@ -763,36 +895,97 @@ esp_err_t firebase_trim_frames(int max_frames)
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK || status_code != 200 || total_read <= 0) {
-        ESP_LOGW(TAG, "Frame list fetch failed: err=%s status=%d", esp_err_to_name(err), status_code);
+        ESP_LOGW(TAG, "Frame count fetch failed: err=%s status=%d", esp_err_to_name(err), status_code);
         free(response);
         xSemaphoreGive(s_http_mutex);
         return ESP_FAIL;
     }
     response[total_read] = '\0';
 
-    cJSON *root = cJSON_Parse(response);
+    cJSON *count_root = cJSON_Parse(response);
     free(response);
-    if (root == NULL || !cJSON_IsObject(root)) {
-        if (root != NULL) {
-            cJSON_Delete(root);
+    if (count_root == NULL || !cJSON_IsObject(count_root)) {
+        if (count_root != NULL) {
+            cJSON_Delete(count_root);
         }
         xSemaphoreGive(s_http_mutex); /* node is empty/null - nothing to trim */
         return ESP_OK;
     }
 
-    int count = cJSON_GetArraySize(root);
+    int count = cJSON_GetArraySize(count_root);
+    cJSON_Delete(count_root);
     if (count <= max_frames) {
-        cJSON_Delete(root);
         xSemaphoreGive(s_http_mutex);
         return ESP_OK;
     }
-
-    /* Build a single multi-path delete body for the oldest (count - max_frames) keys. */
     int excess = count - max_frames;
+
+    /* Step 2: fetch only the oldest `excess` keys directly via orderBy +
+     * limitToFirst (no shallow this time - that combo is what's illegal,
+     * not orderBy/limitToFirst alone). This returns full frame bodies, but
+     * only for the small number of entries actually being deleted, not the
+     * whole collection - the JSON-escaped quotes around $key are required
+     * by the RTDB REST API's query syntax. */
+    char list_url[FIREBASE_URL_PATH_SIZE];
+    snprintf(list_url, sizeof(list_url),
+             "%s/devices/%s/frames.json?orderBy=%%22$key%%22&limitToFirst=%d",
+             s_firebase.database_url,
+             s_firebase.device_id,
+             excess);
+
+    char *list_response = malloc(buf_size);
+    if (list_response == NULL) {
+        xSemaphoreGive(s_http_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_config_t list_config = {
+        .url = list_url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+        .buffer_size = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t list_client = esp_http_client_init(&list_config);
+    if (list_client == NULL) {
+        free(list_response);
+        xSemaphoreGive(s_http_mutex);
+        return ESP_FAIL;
+    }
+
+    esp_err_t list_err = esp_http_client_perform(list_client);
+    int list_status = esp_http_client_get_status_code(list_client);
+    int list_read = 0;
+    if (list_err == ESP_OK && list_status == 200) {
+        list_read = esp_http_client_read_response(list_client, list_response, buf_size - 1);
+    }
+    esp_http_client_cleanup(list_client);
+
+    if (list_err != ESP_OK || list_status != 200 || list_read <= 0) {
+        ESP_LOGW(TAG, "Oldest-frames fetch failed: err=%s status=%d", esp_err_to_name(list_err), list_status);
+        free(list_response);
+        xSemaphoreGive(s_http_mutex);
+        return ESP_FAIL;
+    }
+    list_response[list_read] = '\0';
+
+    cJSON *root = cJSON_Parse(list_response);
+    free(list_response);
+    if (root == NULL || !cJSON_IsObject(root)) {
+        if (root != NULL) {
+            cJSON_Delete(root);
+        }
+        xSemaphoreGive(s_http_mutex);
+        return ESP_FAIL;
+    }
+
+    /* Build a single multi-path delete body from the returned keys - their
+     * values (full frame bodies) aren't needed, only which keys to delete. */
     cJSON *delete_body = cJSON_CreateObject();
     cJSON *child = root->child;
     int marked = 0;
-    while (child != NULL && marked < excess) {
+    while (child != NULL) {
         cJSON_AddNullToObject(delete_body, child->string);
         child = child->next;
         marked++;

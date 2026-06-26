@@ -36,6 +36,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "firebase.h"
+#include "device_pin.h"
 #include "esp_sntp.h"
 #include "esp_timer.h"  // For esp_timer_get_time()
 #include "ota_update.h"
@@ -66,6 +67,7 @@ static void mount_spiffs(void);
 static void on_client_connected(void);
 static void on_client_disconnected(void);
 static void on_ip_obtained(const char *ip_str);
+static void ip_obtained_task(void *arg);
 static void blink_config_mode_led(void);
 static void reconfigure_wifi_stream(device_mode_t mode);
 static void init_ntp_sync(void);
@@ -92,7 +94,7 @@ typedef struct {
     char frame_id_buf[64];
 } firebase_queue_item_t;
 
-#define FIREBASE_QUEUE_LEN 4
+#define FIREBASE_QUEUE_LEN 6
 static QueueHandle_t s_firebase_queue = NULL;
 
 /* Keep at most this many frames in Firebase (oldest are pruned) to stay within
@@ -141,11 +143,20 @@ static void firebase_enqueue_frame(const firebase_frame_t *frame, const char *fr
 * Private functions
 ******************************************************************************/
 
+/* Guards against spawning a new fall_alert_task on every single frame that
+ * still reports POSTURE_FALL while the radar's fall_recovery_frames cooldown
+ * is active (multiple frames per second, for several seconds, all classify
+ * as FALL once confirmed). Without this, each of those frames spawned its
+ * own concurrent 5s LED-blink task, all fighting over the same RMT channel
+ * ("channel not in init state" storms) and each one also forced an
+ * immediate, unthrottled Firebase push - see radar_detection_callback. */
+static bool s_fall_alert_active = false;
+
 /* Fall alert task - non-blocking LED blink for fall detection */
 static void fall_alert_task(void *arg)
 {
     ESP_LOGW(TAG, "Fall alert task started - blinking LED for 5 seconds");
-    
+
     /* Blink RED LED for 5 seconds with 100ms interval */
     for (int j = 0; j < 50; j++) {
         ws2812_set_color_all((ws2812_color_t)WS2812_COLOR_RED);
@@ -155,11 +166,12 @@ static void fall_alert_task(void *arg)
         ws2812_show();
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    
+
     /* Play alert sound */
     //app_play_alert_sound();
-    
+
     ESP_LOGW(TAG, "Fall alert task completed");
+    s_fall_alert_active = false; /* re-arm: a later fall event can alert again */
     vTaskDelete(NULL);
 }
 
@@ -175,6 +187,17 @@ static void firebase_command_task(void *arg)
 
     while (1) {
         if (firebase_is_ready()) {
+            /* One-time sync of a freshly-generated first-boot PIN (see
+             * device_pin_init in device_pin.c). Retries here every 5s until
+             * it succeeds, rather than being cleared on a transient
+             * network failure. */
+            char pending_pin[8];
+            if (device_pin_get_pending_sync(pending_pin, sizeof(pending_pin))) {
+                if (firebase_post_device_pin(pending_pin) == ESP_OK) {
+                    device_pin_clear_pending_sync();
+                }
+            }
+
             firebase_command_t cmd = firebase_check_for_reset_command();
             if (cmd == FIREBASE_CMD_RESET) {
                 ESP_LOGW(TAG, "Reset command received from Firebase - restarting device");
@@ -398,10 +421,33 @@ static void blink_config_mode_led(void)
     }
 }
 
-/* IP obtained callback - post to Firebase and initialize SNTP */
+/* IP obtained callback - fires directly on the WiFi/IP driver's event loop
+ * task. init_ntp_sync() can block for up to 10s waiting for time sync, and
+ * firebase_post_device_info() is a blocking HTTPS call that also takes the
+ * same s_http_mutex the frame-push task needs - doing either inline here
+ * would stall the system event task AND block frame pushing (the radar
+ * keeps enqueueing the whole time) for that entire window, right when the
+ * network is least settled (just after acquiring an IP). Hand off to a
+ * one-shot task instead so this callback returns immediately. */
 static void on_ip_obtained(const char *ip_str)
 {
     ESP_LOGI(TAG, "Device IP obtained: %s", ip_str);
+
+    char *ip_copy = strdup(ip_str);
+    if (ip_copy == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate IP string for ip_obtained_task");
+        return;
+    }
+    if (xTaskCreate(ip_obtained_task, "ip_obtained", 4096, ip_copy, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ip_obtained_task");
+        free(ip_copy);
+    }
+}
+
+/* Takes ownership of the heap-allocated ip_str and frees it. */
+static void ip_obtained_task(void *arg)
+{
+    char *ip_str = (char *)arg;
 
     /* Initialize SNTP now that we have network connectivity */
     init_ntp_sync();
@@ -413,6 +459,9 @@ static void on_ip_obtained(const char *ip_str)
             ESP_LOGW(TAG, "Failed to post device info to Firebase: %s", esp_err_to_name(err));
         }
     }
+
+    free(ip_str);
+    vTaskDelete(NULL);
 }
 
 /* Initialize SNTP for time synchronization - must be called after WiFi is connected */
@@ -459,9 +508,16 @@ static void init_ntp_sync(void)
     ESP_LOGW(TAG, "Time synchronization timeout - continuing anyway");
 }
 
-/* Firebase push throttle to avoid WiFi watchdog trigger */
+/* Firebase push throttle: while someone is present, this is a periodic
+ * presence/posture heartbeat to the cloud, not a live feed - the LAN TCP
+ * stream (wifi_stream_send, see radar_sensor.c) already serves real-time
+ * point-cloud data for the app's "Live (LAN)" view. 5000ms gives generous
+ * headroom over a single push's worst-case latency (fresh TLS handshake
+ * each time, no keep-alive) so the push task can fully drain the queue
+ * between enqueues even when one push is slow, instead of falling behind
+ * and dropping frames. */
 static uint32_t s_last_firebase_push_ms = 0;
-#define FIREBASE_PUSH_MIN_INTERVAL_MS 500
+#define FIREBASE_PUSH_MIN_INTERVAL_MS 5000
 
 /* Frame ID counter for unique keys */
 static uint32_t s_frame_id_counter = 0;
@@ -514,17 +570,39 @@ static void radar_detection_callback(const human_target_t *targets, int target_c
     if (should_send && s_last_detection_time == 0) {
         s_last_detection_time = now_ms;
     }
-    
+
+    // A fall must reach the cloud immediately, not wait out the presence
+    // heartbeat interval - the local LED/buzzer alert below is already
+    // instant, but this is what gets the event (and any app notification
+    // tied to it) to Firebase. Only the *new* fall (s_fall_alert_active not
+    // already set) bypasses the throttle - the radar keeps reporting
+    // POSTURE_FALL for several consecutive frames while its own
+    // fall_recovery_frames cooldown is active, and unthrottling every one of
+    // those would flood the push queue exactly when the system most needs
+    // to stay responsive (see the fall_alert_task storm this fixed).
+    bool any_fall = false;
+    for (int i = 0; i < target_count; i++) {
+        if (targets[i].posture == POSTURE_FALL) {
+            any_fall = true;
+            break;
+        }
+    }
+    bool new_fall_event = any_fall && !s_fall_alert_active;
+
     /* Firebase push throttle to avoid WiFi watchdog trigger */
     uint32_t this_push_ms = esp_timer_get_time() / 1000;
     bool rate_limited = false;
-    if (s_last_firebase_push_ms > 0 &&
+    if (!new_fall_event && s_last_firebase_push_ms > 0 &&
         this_push_ms - s_last_firebase_push_ms < FIREBASE_PUSH_MIN_INTERVAL_MS) {
         rate_limited = true;
     }
     
-    /* Push frame data to Firebase */
-    if (!rate_limited && should_send && firebase_is_ready()) {
+    /* Push frame data to Firebase. wifi_stream_is_connected() (has an IP)
+     * is checked separately from firebase_is_ready() (which only reflects
+     * local init/enabled state, not actual network reachability) - without
+     * it, the radar task starts pushing before WiFi finishes associating
+     * and DNS resolution guaranteed-fails ("getaddrinfo() returns 202"). */
+    if (!rate_limited && should_send && firebase_is_ready() && wifi_stream_is_connected()) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
         time_t now_sec = (time_t)tv.tv_sec;
@@ -543,39 +621,35 @@ static void radar_detection_callback(const human_target_t *targets, int target_c
                  tm_info.tm_sec,
                  counter);
         
-        if (target_count > 0) {
-            firebase_frame_t fb_frame = {
-                .x = targets[0].center_x,
-                .y = targets[0].center_y,
-                .z = targets[0].center_z,
-                .velocity = targets[0].avg_velocity,
-                .posture = (uint8_t)targets[0].posture,
-                .confidence = targets[0].confidence,
-                .present = targets[0].present,
-                .timestamp = now_sec,
-                .timestamp_ms = now_ms,
-                .frame_id = frame_id,
-                .temperature = firebase_read_cpu_temperature(),
-            };
-            
-            firebase_enqueue_frame(&fb_frame, frame_id);
-        } else {
-            firebase_frame_t fb_frame = {
-                .x = 0.0f,
-                .y = 0.0f,
-                .z = 0.0f,
-                .velocity = 0.0f,
-                .posture = 6,
-                .confidence = 0.0f,
-                .present = false,
-                .timestamp = now_sec,
-                .timestamp_ms = now_ms,
-                .frame_id = frame_id,
-                .temperature = firebase_read_cpu_temperature(),
-            };
-            
-            firebase_enqueue_frame(&fb_frame, frame_id);
+        firebase_frame_t fb_frame = {
+            .target_count = 0,
+            .present = (target_count > 0),
+            .timestamp = now_sec,
+            .timestamp_ms = now_ms,
+            .frame_id = frame_id,
+            .temperature = firebase_read_cpu_temperature(),
+        };
+
+        int n = target_count;
+        if (n > FIREBASE_MAX_TARGETS) {
+            ESP_LOGW(TAG, "%d targets detected, reporting only the first %d to Firebase",
+                     n, FIREBASE_MAX_TARGETS);
+            n = FIREBASE_MAX_TARGETS;
         }
+        for (int i = 0; i < n; i++) {
+            fb_frame.targets[i] = (firebase_target_t){
+                .track_id = targets[i].track_id,
+                .x = targets[i].center_x,
+                .y = targets[i].center_y,
+                .z = targets[i].center_z,
+                .velocity = targets[i].avg_velocity,
+                .posture = (uint8_t)targets[i].posture,
+                .confidence = targets[i].confidence,
+            };
+        }
+        fb_frame.target_count = n;
+
+        firebase_enqueue_frame(&fb_frame, frame_id);
         
         s_last_firebase_push_ms = this_push_ms;
     }
@@ -584,15 +658,22 @@ static void radar_detection_callback(const human_target_t *targets, int target_c
         /* Human detected */
         ESP_LOGD(TAG, "Human detected: %d target(s)", target_count);
         
-        /* Check for fall first - highest priority */
+        /* Check for fall first - highest priority. Only spawn one alert task
+         * per fall event (s_fall_alert_active gates this) - the radar keeps
+         * reporting POSTURE_FALL for multiple consecutive frames while its
+         * fall_recovery_frames cooldown is active, and spawning a new
+         * fall_alert_task on every one of those frames is what caused the
+         * concurrent-RMT-access storm ("channel not in init state" spam). */
         for (int i = 0; i < target_count; i++) {
             if (targets[i].posture == POSTURE_FALL) {
-                ESP_LOGW(TAG, "FALL DETECTED! Target %d at (%.2f, %.2f, %.2f)",
-                    i, targets[i].center_x, targets[i].center_y, targets[i].center_z);
-                
-                /* Start fall alert task (non-blocking) */
-                xTaskCreate(fall_alert_task, "fall_alert", 2048, NULL, 5, NULL);
-                
+                if (!s_fall_alert_active) {
+                    s_fall_alert_active = true;
+                    ESP_LOGW(TAG, "FALL DETECTED! Target %d at (%.2f, %.2f, %.2f)",
+                        i, targets[i].center_x, targets[i].center_y, targets[i].center_z);
+
+                    /* Start fall alert task (non-blocking) */
+                    xTaskCreate(fall_alert_task, "fall_alert", 2048, NULL, 5, NULL);
+                }
                 break;
             }
         }
@@ -924,6 +1005,12 @@ void app_main(void)
     esp_err_t radar_err = radar_sensor_init(&radar_cfg);
     if (radar_err == ESP_OK) {
         radar_start();
+        /* Pushes any saved calibration/confidence settings into the live
+         * detection config - radar_sensor_init() only ever applies
+         * RADAR_CONFIG_DEFAULT(), so without this call, anything saved via
+         * /radar_save or /radar_calibrate would be persisted to NVS but
+         * never actually take effect. */
+        web_server_apply_radar_config();
     } else {
         ESP_LOGE(TAG, "Radar initialization failed: %s", esp_err_to_name(radar_err));
     }

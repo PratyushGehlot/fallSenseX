@@ -17,15 +17,31 @@
 extern "C" {
 #endif
 
-/* Frame data structure for Firebase - consolidated human location frame + temperature */
+/* Maximum simultaneous people reported per frame. Mirrors RADAR_MAX_TARGETS
+ * in radar_sensor.h - kept as a separate constant so this header doesn't
+ * need to depend on the radar component, but the two must stay in sync. */
+#define FIREBASE_MAX_TARGETS 5
+
+/* One detected person within a frame. track_id is the radar tracker's
+ * stable per-person ID (see human_target_t.track_id in radar_sensor.h) -
+ * it's the key the app uses to tell "same person" apart from "different
+ * person" across frames, so it's pushed as the JSON object key rather than
+ * just another field (see push_frame_to_firebase in firebase.c). */
 typedef struct {
+    uint8_t track_id;
     float x;            /* X coordinate in meters */
     float y;            /* Y coordinate in meters */
     float z;            /* Z coordinate in meters */
     float velocity;     /* Velocity in m/s */
     uint8_t posture;    /* Posture enum value */
     float confidence;   /* Detection confidence 0.0-1.0 */
-    bool present;       /* Human presence status */
+} firebase_target_t;
+
+/* Frame data structure for Firebase - consolidated human location frame(s) + temperature */
+typedef struct {
+    firebase_target_t targets[FIREBASE_MAX_TARGETS];
+    int target_count;   /* Number of valid entries in targets[] (0 = nobody present) */
+    bool present;        /* True if target_count > 0 */
     uint32_t timestamp; /* Unix timestamp in seconds */
     uint32_t timestamp_ms; /* Milliseconds part */
     const char *frame_id; /* Optional custom frame ID (if NULL, auto-generated) */
@@ -114,6 +130,24 @@ esp_err_t firebase_get_last_status(void);
  */
 esp_err_t firebase_post_device_info(const char *ip_address, const char *port,
                                      const char *firmware_version, const char *device_model);
+
+/**
+ * @brief Push the device's local-access PIN to /devices/{deviceId}/secrets/pin
+ *        so the owner can retrieve it from the app instead of reading serial
+ *        logs. Only call this once, right after device_pin_init() generates
+ *        a brand-new PIN - never on every boot, and never with a
+ *        user-rotated PIN (device_pin_change() does not call this).
+ * @details Firebase security rules restrict read access on this path to the
+ *          device's owner only (not shared viewers) - see firebase_rules.json.
+ *          This still means the PIN is stored in plaintext in the cloud,
+ *          trading the "local-only secret independent of the cloud account"
+ *          property for retrievability. Acceptable if you've decided that
+ *          tradeoff is worth it; if not, don't call this and keep relying on
+ *          the serial-log-at-flash-time workflow instead.
+ * @param pin The plaintext PIN to store
+ * @return ESP_OK on success, error code on failure
+ */
+esp_err_t firebase_post_device_pin(const char *pin);
 
 /**
  * @brief Post device heartbeat/online status to Firebase

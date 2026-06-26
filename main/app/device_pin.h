@@ -33,6 +33,22 @@ bool device_pin_verify(const char *pin);
 esp_err_t device_pin_change(const char *old_pin, const char *new_pin);
 
 /**
+ * @brief Check whether a freshly-generated first-boot PIN is still waiting
+ *        to be synced to Firebase (see device_pin_clear_pending_sync()).
+ * @param out_pin Filled with the pending PIN if one is pending (may be NULL to just check)
+ * @param out_len Size of out_pin buffer
+ * @return true if a PIN is pending sync, false otherwise
+ */
+bool device_pin_get_pending_sync(char *out_pin, size_t out_len);
+
+/**
+ * @brief Mark the pending first-boot PIN as synced (call only after a
+ *        successful push to Firebase, so a transient network failure can
+ *        retry instead of losing the PIN silently).
+ */
+void device_pin_clear_pending_sync(void);
+
+/**
  * @brief Require a valid X-Device-PIN header on the request.
  * @details On failure, sends a 401 JSON response and returns false. Callers
  *          must return immediately (without sending another response) when

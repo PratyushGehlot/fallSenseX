@@ -283,6 +283,16 @@ static void tcp_accept_task(void *arg)
         char addr_str[INET_ADDRSTRLEN];
         inet_ntoa_r(client_addr.sin_addr, addr_str, sizeof(addr_str));
 
+        /* wifi_stream_send() runs on radar_rx_task, the highest-priority
+         * task in the system - a plain blocking send() to a stalled client
+         * (weak WiFi, backgrounded app) would freeze the entire radar
+         * pipeline until the OS-level TCP retransmit timeout gives up
+         * (can be tens of seconds to minutes). Capping the send timeout
+         * means a stuck client gets dropped quickly instead of stalling
+         * detection and Firebase pushes along with it. */
+        struct timeval send_timeout = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+
         xSemaphoreTake(s_client_mutex, portMAX_DELAY);
         int slot = -1;
         for (int i = 0; i < WIFI_STREAM_MAX_CLIENTS; i++) {

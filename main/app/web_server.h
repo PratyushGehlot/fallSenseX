@@ -45,6 +45,13 @@ esp_err_t web_server_set_wifi_credentials(const char *ssid, const char *password
 /* Get LED brightness (0-100) */
 int web_server_get_led_brightness(void);
 
+/* Pushes the persisted radar calibration/confidence settings into the
+ * live radar_sensor_t config. Must be called once after
+ * radar_sensor_init() succeeds (the settings have no effect before
+ * that), and is also called automatically on every /radar_save or
+ * /radar_calibrate. */
+void web_server_apply_radar_config(void);
+
 /* OTA update */
 esp_err_t web_server_ota_check_update(const char *server_url, const char *firmware_version);
 esp_err_t web_server_ota_start_update(const char *url);

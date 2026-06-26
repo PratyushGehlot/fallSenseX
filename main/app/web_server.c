@@ -49,6 +49,17 @@ typedef struct {
     float fall_height_drop;
     int fall_hold_time;    // seconds
     float human_confidence;
+    // Posture height thresholds (meters) - set by /radar_calibrate or manually.
+    // Defaults must match RADAR_CONFIG_DEFAULT() in radar_sensor.h.
+    float standing_z;
+    float sitting_z;
+    float lying_z;
+    // Per-point confidence formula tunables - see point_confidence() in
+    // radar_sensor.c. Defaults must match RADAR_CONFIG_DEFAULT().
+    float conf_snr_max;
+    float conf_abs_max;
+    float conf_dpk_max;
+    float conf_point_threshold;
 } radar_config_web_t;
 
 static radar_config_web_t s_radar_config = {
@@ -63,6 +74,13 @@ static radar_config_web_t s_radar_config = {
     .fall_height_drop = 0.25f,
     .fall_hold_time = 5,
     .human_confidence = 0.3f,
+    .standing_z = 1.0f,
+    .sitting_z = 0.6f,
+    .lying_z = 0.25f,
+    .conf_snr_max = 40.0f,
+    .conf_abs_max = 15.0f,
+    .conf_dpk_max = 10.0f,
+    .conf_point_threshold = 0.4f,
 };
 
 /* HTML Pages */
@@ -99,6 +117,10 @@ static const char *INDEX_HTML =
     "<div class=\"info\">"
     "<p><strong>Device Mode:</strong> <span id=\"mode\">Normal</span></p>"
     "<p><strong>MAC:</strong> <span id=\"mac\">Loading...</span></p>"
+    "</div>"
+    "<div class=\"form-group\">"
+    "<label>Device PIN (required for save/reset/restart/OTA/calibrate):</label>"
+    "<input type=\"text\" id=\"devicePin\" placeholder=\"1234\">"
     "</div>"
     "<h2>WiFi Configuration</h2>"
     "<form id=\"wifiForm\">"
@@ -197,9 +219,46 @@ static const char *INDEX_HTML =
     "</div>"
     "</div>"
     "</div>"
+    "<h3>Posture Confidence (advanced)</h3>"
+    "<div class=\"row\">"
+    "<div class=\"col\">"
+    "<div class=\"form-group\">"
+    "<label>SNR max:</label>"
+    "<input type=\"number\" id=\"confSnrMax\" name=\"confSnrMax\" step=\"1\" min=\"1\" max=\"200\" value=\"40\">"
+    "</div>"
+    "</div>"
+    "<div class=\"col\">"
+    "<div class=\"form-group\">"
+    "<label>ABS max:</label>"
+    "<input type=\"number\" id=\"confAbsMax\" name=\"confAbsMax\" step=\"1\" min=\"1\" max=\"200\" value=\"15\">"
+    "</div>"
+    "</div>"
+    "</div>"
+    "<div class=\"row\">"
+    "<div class=\"col\">"
+    "<div class=\"form-group\">"
+    "<label>DPK max:</label>"
+    "<input type=\"number\" id=\"confDpkMax\" name=\"confDpkMax\" step=\"1\" min=\"1\" max=\"200\" value=\"10\">"
+    "</div>"
+    "</div>"
+    "<div class=\"col\">"
+    "<div class=\"form-group\">"
+    "<label>Point Confidence Threshold:</label>"
+    "<input type=\"number\" id=\"confPointThresh\" name=\"confPointThresh\" step=\"0.05\" min=\"0\" max=\"1\" value=\"0.4\">"
+    "</div>"
+    "</div>"
+    "</div>"
     "<button type=\"submit\">Save Radar Settings</button>"
     "<button type=\"button\" class=\"danger\" onclick=\"resetRadar()\">Reset to Defaults</button>"
     "</form>"
+    "<h2>Posture Calibration</h2>"
+    "<div class=\"info\">"
+    "<p>Stand/sit/lie under the sensor in the actual installation position, then click the matching button to capture the real height for that posture. This updates the standing/sitting/lying Z thresholds used for classification.</p>"
+    "<p>Standing Z: <span id=\"standingZ\">--</span> m &nbsp; Sitting Z: <span id=\"sittingZ\">--</span> m &nbsp; Lying Z: <span id=\"lyingZ\">--</span> m</p>"
+    "<button type=\"button\" onclick=\"calibrate('standing')\">Capture Standing</button>"
+    "<button type=\"button\" onclick=\"calibrate('sitting')\">Capture Sitting</button>"
+    "<button type=\"button\" onclick=\"calibrate('lying')\">Capture Lying</button>"
+    "</div>"
     "<h2>Device Information</h2>"
     "<div class=\"info\">"
     "<p>FassSenseX - mmWave Radar Fall Detection</p>"
@@ -218,6 +277,7 @@ static const char *INDEX_HTML =
     "<p><input type=\"text\" id=\"otaUrl\" placeholder=\"Direct firmware URL\"></p>"
     "<p><button onclick=\"otaUpdate()\">Start OTA from URL</button></p>"
     "</div>"
+    "<button type=\"button\" class=\"danger\" onclick=\"restartDevice()\">Restart Device</button>"
     "</div>"
     "</div>"
     "<script>"
@@ -247,7 +307,19 @@ static const char *INDEX_HTML =
     "    document.getElementById('fallThresh').value = data.fallThresh;\n"
     "    document.getElementById('fallDrop').value = data.fallDrop;\n"
     "    document.getElementById('fallHold').value = data.fallHold;\n"
+    "    document.getElementById('confSnrMax').value = data.confSnrMax;\n"
+    "    document.getElementById('confAbsMax').value = data.confAbsMax;\n"
+    "    document.getElementById('confDpkMax').value = data.confDpkMax;\n"
+    "    document.getElementById('confPointThresh').value = data.confPointThresh;\n"
+    "    document.getElementById('standingZ').innerText = data.standingZ;\n"
+    "    document.getElementById('sittingZ').innerText = data.sittingZ;\n"
+    "    document.getElementById('lyingZ').innerText = data.lyingZ;\n"
     "  });\n"
+    "\n"
+    "function pinHeaders() {"
+    "  var pin = document.getElementById('devicePin').value;"
+    "  return {'Content-Type': 'application/json', 'X-Device-PIN': pin};"
+    "}"
     "\n"
     "document.getElementById('wifiForm').addEventListener('submit', function(e) {"
     "  e.preventDefault();"
@@ -308,11 +380,15 @@ static const char *INDEX_HTML =
     "    humanConf: parseFloat(document.getElementById('humanConf').value),"
     "    fallThresh: parseFloat(document.getElementById('fallThresh').value),"
     "    fallDrop: parseFloat(document.getElementById('fallDrop').value),"
-    "    fallHold: parseInt(document.getElementById('fallHold').value)"
+    "    fallHold: parseInt(document.getElementById('fallHold').value),"
+    "    confSnrMax: parseFloat(document.getElementById('confSnrMax').value),"
+    "    confAbsMax: parseFloat(document.getElementById('confAbsMax').value),"
+    "    confDpkMax: parseFloat(document.getElementById('confDpkMax').value),"
+    "    confPointThresh: parseFloat(document.getElementById('confPointThresh').value)"
     "  };"
     "  fetch('/radar_save', {"
     "    method: 'POST',"
-    "    headers: {'Content-Type': 'application/json'},"
+    "    headers: pinHeaders(),"
     "    body: JSON.stringify(data)"
     "  })"
     "  .then(response => response.json())"
@@ -324,6 +400,23 @@ static const char *INDEX_HTML =
     "    }"
     "  });"
     "});"
+    ""
+    "function calibrate(phase) {"
+    "  fetch('/radar_calibrate', {"
+    "    method: 'POST',"
+    "    headers: pinHeaders(),"
+    "    body: JSON.stringify({phase: phase})"
+    "  })"
+    "  .then(response => response.json())"
+    "  .then(data => {"
+    "    if(data.success) {"
+    "      alert('Captured ' + phase + ': height=' + data.capturedHeight.toFixed(2) + 'm, threshold=' + data.appliedThreshold.toFixed(2) + 'm' + (data.thresholdsOrdered ? '' : ' (WARNING: thresholds out of order, recalibrate other postures)'));"
+    "      location.reload();"
+    "    } else {"
+    "      alert('Error: ' + data.error);"
+    "    }"
+    "  });"
+    "}"
     ""
     "fetch('/ota_config')"
     "  .then(r => r.json())"
@@ -373,7 +466,7 @@ static const char *INDEX_HTML =
     "  if(confirm('Start OTA update from this URL?')) {"
     "    fetch('/ota_update', {"
     "      method: 'POST',"
-    "      headers: {'Content-Type': 'application/json'},"
+    "      headers: pinHeaders(),"
     "      body: JSON.stringify({url: url})"
     "    })"
     "    .then(response => response.json())"
@@ -384,19 +477,20 @@ static const char *INDEX_HTML =
     "  }"
     "}"
     ""
-    "function restartDevice() {"
+    "function resetRadar() {"
     "  if(confirm('Reset radar settings to defaults?')) {"
-    "    fetch('/radar_reset', { method: 'POST' })"
+    "    fetch('/radar_reset', { method: 'POST', headers: pinHeaders() })"
     "    .then(r => r.json())"
     "    .then(data => {"
     "      if(data.success) alert('Reset to defaults! Restarting...');"
+    "      else alert('Error: ' + data.error);"
     "    });"
     "  }"
     "}"
     ""
     "function restartDevice() {"
     "  if(confirm('Restart device?')) {"
-    "    fetch('/restart', { method: 'POST' })"
+    "    fetch('/restart', { method: 'POST', headers: pinHeaders() })"
     "    .then(r => r.json())"
     "    .then(data => { alert('Restarting...'); });"
     "  }"
@@ -921,6 +1015,13 @@ esp_err_t web_server_get_wifi_credentials(char *ssid, size_t ssid_len, char *pas
 #define NVS_KEY_FALL_HEIGHT_DROP "fall_drop"
 #define NVS_KEY_FALL_HOLD_TIME "fall_hold"
 #define NVS_KEY_HUMAN_CONF "human_conf"
+#define NVS_KEY_STANDING_Z "standing_z"
+#define NVS_KEY_SITTING_Z "sitting_z"
+#define NVS_KEY_LYING_Z "lying_z"
+#define NVS_KEY_CONF_SNR_MAX "conf_snr"
+#define NVS_KEY_CONF_ABS_MAX "conf_abs"
+#define NVS_KEY_CONF_DPK_MAX "conf_dpk"
+#define NVS_KEY_CONF_POINT_THRESH "conf_pt_th"
 
 /* Load radar configuration from NVS */
 static void load_radar_config(void)
@@ -944,6 +1045,13 @@ static void load_radar_config(void)
     if (nvs_get_i32(nvs_handle, NVS_KEY_FALL_HEIGHT_DROP, &val) == ESP_OK) s_radar_config.fall_height_drop = (float)val / 100.0f;
     if (nvs_get_i32(nvs_handle, NVS_KEY_FALL_HOLD_TIME, &val) == ESP_OK) s_radar_config.fall_hold_time = val;
     if (nvs_get_i32(nvs_handle, NVS_KEY_HUMAN_CONF, &val) == ESP_OK) s_radar_config.human_confidence = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_STANDING_Z, &val) == ESP_OK) s_radar_config.standing_z = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_SITTING_Z, &val) == ESP_OK) s_radar_config.sitting_z = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_LYING_Z, &val) == ESP_OK) s_radar_config.lying_z = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_CONF_SNR_MAX, &val) == ESP_OK) s_radar_config.conf_snr_max = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_CONF_ABS_MAX, &val) == ESP_OK) s_radar_config.conf_abs_max = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_CONF_DPK_MAX, &val) == ESP_OK) s_radar_config.conf_dpk_max = (float)val / 100.0f;
+    if (nvs_get_i32(nvs_handle, NVS_KEY_CONF_POINT_THRESH, &val) == ESP_OK) s_radar_config.conf_point_threshold = (float)val / 100.0f;
 
     nvs_close(nvs_handle);
     ESP_LOGI(TAG, "Loaded radar config from NVS");
@@ -971,6 +1079,13 @@ esp_err_t web_server_set_radar_config(const radar_config_web_t *config)
     set_err |= nvs_set_i32(nvs_handle, NVS_KEY_FALL_HEIGHT_DROP, (int32_t)(config->fall_height_drop * 100));
     set_err |= nvs_set_i32(nvs_handle, NVS_KEY_FALL_HOLD_TIME, config->fall_hold_time);
     set_err |= nvs_set_i32(nvs_handle, NVS_KEY_HUMAN_CONF, (int32_t)(config->human_confidence * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_STANDING_Z, (int32_t)(config->standing_z * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_SITTING_Z, (int32_t)(config->sitting_z * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_LYING_Z, (int32_t)(config->lying_z * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_CONF_SNR_MAX, (int32_t)(config->conf_snr_max * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_CONF_ABS_MAX, (int32_t)(config->conf_abs_max * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_CONF_DPK_MAX, (int32_t)(config->conf_dpk_max * 100));
+    set_err |= nvs_set_i32(nvs_handle, NVS_KEY_CONF_POINT_THRESH, (int32_t)(config->conf_point_threshold * 100));
     if (set_err != ESP_OK) {
         ESP_LOGW(TAG, "One or more radar config fields failed to write to NVS");
     }
@@ -990,6 +1105,35 @@ void web_server_get_radar_config(radar_config_web_t *config)
     *config = s_radar_config;
 }
 
+/* Pushes the persisted radar settings (s_radar_config) into the live
+ * detection engine (radar_sensor.c's s_config). Previously these were
+ * saved to NVS and echoed back by /radar_status, but radar_sensor_init()
+ * was only ever called with RADAR_CONFIG_DEFAULT() - none of this ever
+ * reached the actual detection code. Call this once after
+ * radar_sensor_init() succeeds (see fall_sense_x_main.c), and again
+ * whenever radar settings are saved or calibrated, to apply changes live
+ * without requiring a reboot. */
+void web_server_apply_radar_config(void)
+{
+    radar_config_t cfg;
+    radar_sensor_get_config(&cfg);
+
+    cfg.standing_z = s_radar_config.standing_z;
+    cfg.sitting_z = s_radar_config.sitting_z;
+    cfg.lying_z = s_radar_config.lying_z;
+    cfg.human_conf_threshold = s_radar_config.human_confidence;
+    cfg.point_conf_snr_max = s_radar_config.conf_snr_max;
+    cfg.point_conf_abs_max = s_radar_config.conf_abs_max;
+    cfg.point_conf_dpk_max = s_radar_config.conf_dpk_max;
+    cfg.point_conf_threshold = s_radar_config.conf_point_threshold;
+
+    radar_sensor_set_config(&cfg);
+    ESP_LOGI(TAG, "Applied radar config: standing_z=%.2f sitting_z=%.2f lying_z=%.2f human_conf=%.2f "
+                  "conf_snr_max=%.1f conf_abs_max=%.1f conf_dpk_max=%.1f conf_point_thresh=%.2f",
+             cfg.standing_z, cfg.sitting_z, cfg.lying_z, cfg.human_conf_threshold,
+             cfg.point_conf_snr_max, cfg.point_conf_abs_max, cfg.point_conf_dpk_max, cfg.point_conf_threshold);
+}
+
 /* Get LED brightness (0-100) */
 int web_server_get_led_brightness(void)
 {
@@ -999,9 +1143,12 @@ int web_server_get_led_brightness(void)
 /* Radar HTTP handlers */
 static esp_err_t radar_status_handler(httpd_req_t *req)
 {
-    char json[512];
+    char json[640];
     int len = snprintf(json, sizeof(json),
-        "{\"mountType\":%d,\"height\":%.1f,\"detMin\":%.1f,\"detMax\":%.1f,\"sensitivity\":%d,\"ledEnabled\":%d,\"ledBrightness\":%d,\"humanConf\":%.2f,\"fallThresh\":%.2f,\"fallDrop\":%.2f,\"fallHold\":%d}",
+        "{\"mountType\":%d,\"height\":%.1f,\"detMin\":%.1f,\"detMax\":%.1f,\"sensitivity\":%d,\"ledEnabled\":%d,\"ledBrightness\":%d,"
+        "\"humanConf\":%.2f,\"fallThresh\":%.2f,\"fallDrop\":%.2f,\"fallHold\":%d,"
+        "\"standingZ\":%.2f,\"sittingZ\":%.2f,\"lyingZ\":%.2f,"
+        "\"confSnrMax\":%.1f,\"confAbsMax\":%.1f,\"confDpkMax\":%.1f,\"confPointThresh\":%.2f}",
         s_radar_config.mount_type,
         s_radar_config.height,
         s_radar_config.detection_min,
@@ -1012,9 +1159,16 @@ static esp_err_t radar_status_handler(httpd_req_t *req)
         s_radar_config.human_confidence,
         s_radar_config.fall_threshold,
         s_radar_config.fall_height_drop,
-        s_radar_config.fall_hold_time
+        s_radar_config.fall_hold_time,
+        s_radar_config.standing_z,
+        s_radar_config.sitting_z,
+        s_radar_config.lying_z,
+        s_radar_config.conf_snr_max,
+        s_radar_config.conf_abs_max,
+        s_radar_config.conf_dpk_max,
+        s_radar_config.conf_point_threshold
     );
-    
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, len);
     return ESP_OK;
@@ -1053,11 +1207,19 @@ static esp_err_t radar_save_handler(httpd_req_t *req)
     if ((item = cJSON_GetObjectItem(root, "fallThresh"))) new_config.fall_threshold = item->valuedouble;
     if ((item = cJSON_GetObjectItem(root, "fallDrop"))) new_config.fall_height_drop = item->valuedouble;
     if ((item = cJSON_GetObjectItem(root, "fallHold"))) new_config.fall_hold_time = item->valueint;
+    if ((item = cJSON_GetObjectItem(root, "standingZ"))) new_config.standing_z = item->valuedouble;
+    if ((item = cJSON_GetObjectItem(root, "sittingZ"))) new_config.sitting_z = item->valuedouble;
+    if ((item = cJSON_GetObjectItem(root, "lyingZ"))) new_config.lying_z = item->valuedouble;
+    if ((item = cJSON_GetObjectItem(root, "confSnrMax"))) new_config.conf_snr_max = item->valuedouble;
+    if ((item = cJSON_GetObjectItem(root, "confAbsMax"))) new_config.conf_abs_max = item->valuedouble;
+    if ((item = cJSON_GetObjectItem(root, "confDpkMax"))) new_config.conf_dpk_max = item->valuedouble;
+    if ((item = cJSON_GetObjectItem(root, "confPointThresh"))) new_config.conf_point_threshold = item->valuedouble;
 
     cJSON_Delete(root);
 
     esp_err_t err = web_server_set_radar_config(&new_config);
     if (err == ESP_OK) {
+        web_server_apply_radar_config();
         httpd_resp_send(req, SUCCESS_JSON, strlen(SUCCESS_JSON));
         ESP_LOGI(TAG, "Radar config saved, restarting...");
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -1086,6 +1248,13 @@ static esp_err_t radar_reset_handler(httpd_req_t *req)
     s_radar_config.fall_height_drop = 0.25f;
     s_radar_config.fall_hold_time = 5;
     s_radar_config.human_confidence = 0.3f;
+    s_radar_config.standing_z = 1.0f;
+    s_radar_config.sitting_z = 0.6f;
+    s_radar_config.lying_z = 0.25f;
+    s_radar_config.conf_snr_max = 40.0f;
+    s_radar_config.conf_abs_max = 15.0f;
+    s_radar_config.conf_dpk_max = 10.0f;
+    s_radar_config.conf_point_threshold = 0.4f;
 
     // Erase only radar config namespace (not all NVS)
     nvs_handle_t nvs_handle;
@@ -1107,6 +1276,101 @@ static esp_err_t radar_reset_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Radar config reset to defaults, restarting...");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+    return ESP_OK;
+}
+
+/* Captures the current detected target's height (the same 85th-percentile
+ * metric classify_posture() uses) and uses it to derive the
+ * standing/sitting/lying threshold for that posture, instead of relying
+ * on the fixed constants that assume a specific sensor mount height.
+ * Applies live immediately (no reboot needed) - stand/sit/lie under the
+ * sensor, hit the matching button, repeat for the other two postures. */
+static esp_err_t radar_calibrate_handler(httpd_req_t *req)
+{
+    if (!device_pin_require(req)) {
+        return ESP_OK;
+    }
+
+    char content[128];
+    int content_len = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (content_len <= 0) {
+        httpd_resp_send(req, ERROR_JSON_PARSE, strlen(ERROR_JSON_PARSE));
+        return ESP_FAIL;
+    }
+    content[content_len] = '\0';
+
+    cJSON *root = cJSON_Parse(content);
+    if (!root) {
+        httpd_resp_send(req, ERROR_JSON_PARSE, strlen(ERROR_JSON_PARSE));
+        return ESP_FAIL;
+    }
+    cJSON *phase_item = cJSON_GetObjectItem(root, "phase");
+    if (!phase_item || !phase_item->valuestring) {
+        cJSON_Delete(root);
+        httpd_resp_send(req, ERROR_JSON_MISSING, strlen(ERROR_JSON_MISSING));
+        return ESP_FAIL;
+    }
+    char phase[16];
+    strncpy(phase, phase_item->valuestring, sizeof(phase) - 1);
+    phase[sizeof(phase) - 1] = '\0';
+    cJSON_Delete(root);
+
+    int count = 0;
+    const human_target_t *targets = radar_get_targets(&count);
+    if (count == 0) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), ERROR_JSON, "No person detected - stand under the sensor and try again");
+        httpd_resp_send(req, buf, strlen(buf));
+        return ESP_OK;
+    }
+
+    int best = 0;
+    for (int i = 1; i < count; i++) {
+        if (targets[i].confidence > targets[best].confidence) best = i;
+    }
+    float captured_height = targets[best].height;
+
+    /* Margins push the threshold slightly inside the captured value so
+     * normal frame-to-frame jitter during real use doesn't sit right on
+     * the boundary. lying_z's margin is larger because classify_posture()
+     * compares against (lying_z + 0.2f), not lying_z directly. */
+    float new_value;
+    if (strcmp(phase, "standing") == 0) {
+        new_value = captured_height - 0.05f;
+        s_radar_config.standing_z = new_value;
+    } else if (strcmp(phase, "sitting") == 0) {
+        new_value = captured_height - 0.05f;
+        s_radar_config.sitting_z = new_value;
+    } else if (strcmp(phase, "lying") == 0) {
+        new_value = captured_height - 0.25f;
+        s_radar_config.lying_z = new_value;
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), ERROR_JSON, "phase must be 'standing', 'sitting', or 'lying'");
+        httpd_resp_send(req, buf, strlen(buf));
+        return ESP_OK;
+    }
+
+    bool order_ok = (s_radar_config.standing_z > s_radar_config.sitting_z) &&
+                     (s_radar_config.sitting_z > s_radar_config.lying_z + 0.2f);
+    if (!order_ok) {
+        ESP_LOGW(TAG, "Calibrated thresholds look out of order (standing=%.2f sitting=%.2f lying=%.2f) - "
+                      "double check you captured each posture correctly",
+                 s_radar_config.standing_z, s_radar_config.sitting_z, s_radar_config.lying_z);
+    }
+
+    esp_err_t err = web_server_set_radar_config(&s_radar_config);
+    web_server_apply_radar_config();
+
+    char buf[224];
+    if (err == ESP_OK) {
+        snprintf(buf, sizeof(buf),
+                 "{\"success\":true,\"phase\":\"%s\",\"capturedHeight\":%.3f,\"appliedThreshold\":%.3f,\"thresholdsOrdered\":%s}",
+                 phase, captured_height, new_value, order_ok ? "true" : "false");
+    } else {
+        snprintf(buf, sizeof(buf), ERROR_JSON, "Failed to persist calibration");
+    }
+    httpd_resp_send(req, buf, strlen(buf));
     return ESP_OK;
 }
 
@@ -1486,6 +1750,12 @@ static const httpd_uri_t radar_reset_uri = {
     .handler = radar_reset_handler
 };
 
+static const httpd_uri_t radar_calibrate_uri = {
+    .uri = "/radar_calibrate",
+    .method = HTTP_POST,
+    .handler = radar_calibrate_handler
+};
+
 static const httpd_uri_t restart_uri = {
     .uri = "/restart",
     .method = HTTP_POST,
@@ -1560,7 +1830,7 @@ esp_err_t web_server_start(void)
 
     const httpd_uri_t *uri_handlers[] = {
         &index_uri, &save_uri, &status_uri, &wifi_scan_uri, &mode_uri,
-        &radar_status_uri, &radar_save_uri, &radar_reset_uri, &restart_uri,
+        &radar_status_uri, &radar_save_uri, &radar_reset_uri, &radar_calibrate_uri, &restart_uri,
         &ota_config_uri, &ota_config_post_uri, &ota_status_uri,
         &ota_update_uri, &pin_change_uri,
     };

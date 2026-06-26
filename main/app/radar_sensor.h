@@ -48,10 +48,20 @@ typedef enum {
 
 typedef struct {
     bool present;
+    /* Stable per-person ID assigned once by the tracker (see s_next_track_id
+     * in radar_sensor.c) and held for as long as the person stays tracked -
+     * lets callers (Firebase frames, the app's 3D viewer) tell "same person,
+     * new frame" apart from "different person" across frames. */
+    uint8_t track_id;
     human_posture_t posture;
     float center_x;
     float center_y;
     float center_z;
+    /* 85th-percentile cluster height - the same robust height metric
+     * classify_posture() uses internally, exposed so calibration (see
+     * web_server.c's /radar_calibrate) captures the exact value the
+     * thresholds are compared against. */
+    float height;
     float avg_velocity;
     float confidence;
     int point_count;
@@ -77,6 +87,20 @@ typedef struct {
     int   fall_recovery_frames;
     float track_gate_radius;
     int   track_miss_limit;
+    /* Per-point confidence formula: confidence = w_snr*min(snr/snr_max,1)
+     * + w_abs*min(abs/abs_max,1) + w_dpk*min(dpk/dpk_max,1). The *_max
+     * values were originally hardcoded guesses that didn't match this
+     * radar's actual signal range (see point_conf_threshold below) -
+     * now tunable without a recompile via /radar_save. */
+    float point_conf_w_snr;
+    float point_conf_w_abs;
+    float point_conf_w_dpk;
+    float point_conf_snr_max;
+    float point_conf_abs_max;
+    float point_conf_dpk_max;
+    /* Minimum per-point confidence to keep a point before clustering.
+     * Used to be a hardcoded 0.4f literal inside detect_humans(). */
+    float point_conf_threshold;
     radar_detection_cb_t detection_cb;
 } radar_config_t;
 
@@ -98,6 +122,13 @@ typedef struct {
     .fall_recovery_frames = 5, \
     .track_gate_radius = 0.8f, \
     .track_miss_limit = 5, \
+    .point_conf_w_snr = 0.45f, \
+    .point_conf_w_abs = 0.40f, \
+    .point_conf_w_dpk = 0.15f, \
+    .point_conf_snr_max = 40.0f, \
+    .point_conf_abs_max = 15.0f, \
+    .point_conf_dpk_max = 10.0f, \
+    .point_conf_threshold = 0.4f, \
     .detection_cb = NULL, \
 }
 
@@ -110,5 +141,12 @@ const human_target_t *radar_get_targets(int *count);
 human_posture_t radar_get_primary_posture(void);
 const char *radar_posture_to_string(human_posture_t posture);
 void radar_sensor_deinit(void);
+
+/* Live config get/set - preserves the detection_cb and any fields the
+ * caller doesn't touch, so callers should get_config() first, modify
+ * just the fields they care about, then set_config(). Thread-safe
+ * (guarded by the same mutex as radar_get_targets()). */
+void radar_sensor_get_config(radar_config_t *out_config);
+void radar_sensor_set_config(const radar_config_t *config);
 
 #endif

@@ -56,22 +56,87 @@ static esp_err_t store_pin(const char *pin)
     return err;
 }
 
-/* TODO(dev-only): fixed to "1234" on every boot while the serial-console
- * PIN-recovery flow gets sorted out. Re-enable the random-default path
- * below before deploying anywhere outside the bench. */
-#define FIXED_DEV_PIN "1234"
+#define DEFAULT_PIN_LEN 6
+
+/* Set when device_pin_init() generates a brand-new PIN this boot, so the
+ * caller can sync it to Firebase once the network/Firebase connection comes
+ * up (device_pin_init runs early, before WiFi - see web_server.c). Cleared
+ * via device_pin_clear_pending_sync() once the caller's push succeeds. */
+static char s_pending_sync_pin[DEFAULT_PIN_LEN + 1] = {0};
+static bool s_has_pending_sync = false;
+
+static bool has_stored_pin(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(PIN_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+    uint8_t hash[PIN_HASH_LEN];
+    size_t hash_len = sizeof(hash);
+    esp_err_t err = nvs_get_blob(nvs, PIN_NVS_KEY_HASH, hash, &hash_len);
+    nvs_close(nvs);
+    return err == ESP_OK && hash_len == PIN_HASH_LEN;
+}
+
+static void generate_default_pin(char *out, size_t out_len)
+{
+    /* Numeric-only default so it's easy to print on a manufacturing label
+     * and type back in on a phone keypad. */
+    uint32_t r;
+    esp_fill_random(&r, sizeof(r));
+    r %= 1000000; /* 6 digits */
+    snprintf(out, out_len, "%06lu", (unsigned long)r);
+}
+
+/* DEV ONLY: force a fixed PIN every boot, bypassing the random-generation
+ * flow below. Remove this #if block before shipping. */
+#define DEV_FIXED_PIN_ENABLED 1
+#define DEV_FIXED_PIN "1357"
 
 esp_err_t device_pin_init(void)
 {
-    esp_err_t set_err = store_pin(FIXED_DEV_PIN);
+#if DEV_FIXED_PIN_ENABLED
+    return store_pin(DEV_FIXED_PIN);
+#endif
+
+    if (has_stored_pin()) {
+        return ESP_OK; /* keep whatever PIN is already on this device */
+    }
+
+    char pin[DEFAULT_PIN_LEN + 1];
+    generate_default_pin(pin, sizeof(pin));
+
+    esp_err_t set_err = store_pin(pin);
     if (set_err == ESP_OK) {
         ESP_LOGW(TAG, "================================================");
-        ESP_LOGW(TAG, " Device PIN fixed to: %s (dev-only, see device_pin.c)", FIXED_DEV_PIN);
+        ESP_LOGW(TAG, " First boot: generated device PIN: %s", pin);
+        ESP_LOGW(TAG, " Record this for the manufacturing label - it will");
+        ESP_LOGW(TAG, " not be logged again.");
         ESP_LOGW(TAG, "================================================");
+        strncpy(s_pending_sync_pin, pin, sizeof(s_pending_sync_pin) - 1);
+        s_pending_sync_pin[sizeof(s_pending_sync_pin) - 1] = '\0';
+        s_has_pending_sync = true;
     } else {
-        ESP_LOGE(TAG, "Failed to store fixed dev PIN: %s", esp_err_to_name(set_err));
+        ESP_LOGE(TAG, "Failed to store generated PIN: %s", esp_err_to_name(set_err));
     }
     return set_err;
+}
+
+bool device_pin_get_pending_sync(char *out_pin, size_t out_len)
+{
+    if (!s_has_pending_sync) {
+        return false;
+    }
+    if (out_pin != NULL && out_len > 0) {
+        strncpy(out_pin, s_pending_sync_pin, out_len - 1);
+        out_pin[out_len - 1] = '\0';
+    }
+    return true;
+}
+
+void device_pin_clear_pending_sync(void)
+{
+    s_has_pending_sync = false;
 }
 
 bool device_pin_verify(const char *pin)
@@ -122,8 +187,17 @@ esp_err_t device_pin_change(const char *old_pin, const char *new_pin)
     return store_pin(new_pin);
 }
 
+/* DEV ONLY: PIN check disabled - always authorized. Remove this early
+ * return before shipping. */
+#define DEV_PIN_CHECK_DISABLED 1
+
 bool device_pin_require(httpd_req_t *req)
 {
+#if DEV_PIN_CHECK_DISABLED
+    (void)req;
+    return true;
+#endif
+
     char pin[PIN_HDR_MAX_LEN] = {0};
     esp_err_t err = httpd_req_get_hdr_value_str(req, "X-Device-PIN", pin, sizeof(pin));
 

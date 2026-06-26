@@ -75,13 +75,69 @@ class HumanDetection {
 class RadarFrame {
   final int timestamp;
   final List<RadarPoint> points;
-  final HumanDetection? humanDetection;
+  final List<HumanDetection> detections;
 
   RadarFrame({
     required this.timestamp,
     required this.points,
-    this.humanDetection,
+    this.detections = const [],
   });
+}
+
+/// Parses the `targets` map a Firebase frame stores person detections
+/// under - see firebase.h's firebase_target_t / push_frame_to_firebase in
+/// firebase.c. Keyed by the radar tracker's stable per-person track ID, so
+/// the returned [HumanDetection.id] can be used as a widget key to keep one
+/// person's avatar/box from flickering or resetting across frames.
+List<HumanDetection> humanDetectionsFromFrameMap(Map<String, dynamic> frameMap) {
+  final targets = frameMap['targets'];
+  if (targets is! Map) return [];
+
+  final result = <HumanDetection>[];
+  targets.forEach((key, value) {
+    if (value is! Map) return;
+    result.add(HumanDetection.fromMap(Map<String, dynamic>.from(value), key.toString()));
+  });
+  result.sort((a, b) => (int.tryParse(a.id) ?? 0).compareTo(int.tryParse(b.id) ?? 0));
+  return result;
+}
+
+/// Milliseconds-since-epoch for a raw Firebase frame map, combining
+/// `timestamp` (seconds) and `timestamp_ms` (sub-second part) - see
+/// firebase.c's push_frame_to_firebase. Falls back to now() if neither is
+/// present, so a malformed/legacy frame still sorts as "most recent" rather
+/// than crashing or sorting first.
+int frameTimestampMs(Map<String, dynamic> frame) {
+  if (frame['timestamp'] != null) {
+    int ms = (frame['timestamp'] as num).toInt() * 1000;
+    if (frame['timestamp_ms'] != null) {
+      ms += (frame['timestamp_ms'] as num).toInt();
+    }
+    return ms;
+  }
+  if (frame['timestamp_ms'] != null) {
+    return (frame['timestamp_ms'] as num).toInt();
+  }
+  return DateTime.now().millisecondsSinceEpoch;
+}
+
+/// Picks the most recent frame out of a raw `/devices/{id}/frames` snapshot
+/// value (a map of frameId -> frame map), or null if there are none.
+Map<String, dynamic>? latestFrameFromSnapshot(Object? snapshotValue) {
+  if (snapshotValue is! Map) return null;
+
+  Map<String, dynamic>? latest;
+  int latestTime = -1;
+  snapshotValue.forEach((key, value) {
+    if (value is! Map) return;
+    final frame = Map<String, dynamic>.from(value);
+    final t = frameTimestampMs(frame);
+    if (t >= latestTime) {
+      latestTime = t;
+      latest = frame;
+    }
+  });
+  return latest;
 }
 
 String formatTimestamp(dynamic timestamp) {

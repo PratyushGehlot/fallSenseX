@@ -219,12 +219,19 @@ esp_err_t radar_stop(void)
     return ret;
 }
 
+/* Weights/denominators read from s_config (tunable via /radar_save)
+ * instead of hardcoded literals - the original 40/15/10 denominators
+ * didn't match this radar's actual snr/abs/dpk range (e.g. a real
+ * sample point with snr=2.45 scores snr_c=0.06 against a /40 denominator,
+ * making the heaviest-weighted term (45%) contribute almost nothing for
+ * completely normal points). See the running min/max logger below for
+ * data to pick better values. */
 static float point_confidence(float snr, float abs_val, float dpk)
 {
-    float snr_c = fminf(snr / 40.0f, 1.0f);
-    float abs_c = fminf(abs_val / 15.0f, 1.0f);
-    float dpk_c = fminf(dpk / 10.0f, 1.0f);
-    return 0.45f * snr_c + 0.40f * abs_c + 0.15f * dpk_c;
+    float snr_c = fminf(snr / s_config.point_conf_snr_max, 1.0f);
+    float abs_c = fminf(abs_val / s_config.point_conf_abs_max, 1.0f);
+    float dpk_c = fminf(dpk / s_config.point_conf_dpk_max, 1.0f);
+    return s_config.point_conf_w_snr * snr_c + s_config.point_conf_w_abs * abs_c + s_config.point_conf_w_dpk * dpk_c;
 }
 
 static float distance_2d(float x1, float y1, float x2, float y2)
@@ -424,15 +431,50 @@ static void update_track_fall_state(target_track_t *tr, const cluster_features_t
     }
 }
 
+/* Logs the observed min/max/mean of raw snr/abs/dpk across all points in
+ * a frame, every ~5s, so the point_conf_*_max denominators above can be
+ * picked from real data instead of guessed. Remove once the confidence
+ * formula has been calibrated against logged data from this sensor. */
+static void log_raw_signal_stats(void)
+{
+    static int64_t s_last_log_us = 0;
+    int64_t now = esp_timer_get_time();
+    if (s_last_log_us != 0 && (now - s_last_log_us) < 5000000) {
+        return;
+    }
+    s_last_log_us = now;
+
+    if (s_frame_point_count == 0) {
+        return;
+    }
+
+    float snr_min = 1e9f, snr_max = -1e9f, snr_sum = 0;
+    float abs_min = 1e9f, abs_max = -1e9f, abs_sum = 0;
+    float dpk_min = 1e9f, dpk_max = -1e9f, dpk_sum = 0;
+
+    for (int i = 0; i < s_frame_point_count; i++) {
+        radar_point_t *p = &s_frame_points[i];
+        snr_min = fminf(snr_min, p->snr); snr_max = fmaxf(snr_max, p->snr); snr_sum += p->snr;
+        abs_min = fminf(abs_min, p->abs_val); abs_max = fmaxf(abs_max, p->abs_val); abs_sum += p->abs_val;
+        dpk_min = fminf(dpk_min, p->dpk); dpk_max = fmaxf(dpk_max, p->dpk); dpk_sum += p->dpk;
+    }
+
+    int n = s_frame_point_count;
+    ESP_LOGI(TAG, "Signal stats (n=%d): snr[%.2f..%.2f avg=%.2f] abs[%.2f..%.2f avg=%.2f] dpk[%.2f..%.2f avg=%.2f]",
+             n, snr_min, snr_max, snr_sum / n, abs_min, abs_max, abs_sum / n, dpk_min, dpk_max, dpk_sum / n);
+}
+
 static void detect_humans(void)
 {
+    log_raw_signal_stats();
+
     int filtered_idx[RADAR_MAX_POINTS];
     int filtered_count = 0;
 
     for (int i = 0; i < s_frame_point_count; i++) {
         radar_point_t *p = &s_frame_points[i];
         float conf = point_confidence(p->snr, p->abs_val, p->dpk);
-        if (conf >= 0.4f) {
+        if (conf >= s_config.point_conf_threshold) {
             filtered_idx[filtered_count++] = i;
         }
     }
@@ -605,10 +647,12 @@ static void detect_humans(void)
 
         human_target_t *t = &new_targets[new_target_count++];
         t->present = true;
+        t->track_id = tr->id;
         t->posture = final_posture;
         t->center_x = tr->x;
         t->center_y = tr->y;
         t->center_z = tr->z;
+        t->height = tr->z_max;
         t->avg_velocity = tr->v;
         t->confidence = f->confidence;
         t->point_count = f->point_count;
@@ -808,6 +852,20 @@ const human_target_t *radar_get_targets(int *count)
     }
     xSemaphoreGive(s_data_mutex);
     return s_targets;
+}
+
+void radar_sensor_get_config(radar_config_t *out_config)
+{
+    xSemaphoreTake(s_data_mutex, portMAX_DELAY);
+    *out_config = s_config;
+    xSemaphoreGive(s_data_mutex);
+}
+
+void radar_sensor_set_config(const radar_config_t *config)
+{
+    xSemaphoreTake(s_data_mutex, portMAX_DELAY);
+    s_config = *config;
+    xSemaphoreGive(s_data_mutex);
 }
 
 human_posture_t radar_get_primary_posture(void)

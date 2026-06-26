@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
@@ -37,7 +38,23 @@ class Live3DViewPage extends StatefulWidget {
 class _Live3DViewPageState extends State<Live3DViewPage> {
   late final RadarTcpService _tcpService;
   static const _clusterer = RadarClusterer();
-  late final Stream<List<HumanDetection>> _liveDetectionsStream;
+
+  /// Single, never-torn-down sink fed by two permanent subscriptions below -
+  /// passed to Radar3DVisualization as a stream that never changes identity.
+  /// Earlier this page swapped the `liveDetectionsStream` prop between the
+  /// raw LAN stream and the raw Cloud (Firebase onValue) stream on every
+  /// toggle, which made the child widget cancel() and immediately re-listen()
+  /// on the same underlying Firebase listener each switch. That repeated
+  /// cancel/relisten raced with the firebase_database plugin's native
+  /// listener teardown/reattach: it worked once, but a second switch back to
+  /// Cloud left the platform-side listener never re-armed, so updates
+  /// silently stopped until the page was rebuilt from scratch. Subscribing
+  /// once for the page's lifetime and just gating which source's events get
+  /// forwarded sidesteps that race entirely.
+  final _activeDetectionsController = StreamController<List<HumanDetection>>.broadcast();
+  StreamSubscription<List<HumanDetection>>? _lanSub;
+  StreamSubscription<List<HumanDetection>>? _cloudSub;
+
   final _ipController = TextEditingController();
   RadarTcpStatus _status = RadarTcpStatus.idle;
   bool _liveMode = false;
@@ -50,11 +67,42 @@ class _Live3DViewPageState extends State<Live3DViewPage> {
       roomWidthM: widget.roomWidthM,
       roomHeightM: widget.roomHeightM,
     );
-    _liveDetectionsStream = _tcpService.frames.map(_clusterer.cluster);
+    _lanSub = _tcpService.frames.map(_clusterer.cluster).listen((d) {
+      if (_liveMode) _activeDetectionsController.add(d);
+    });
+    _cloudSub = FirebaseDatabase.instance
+        .ref('devices/${widget.deviceId}/frames')
+        .onValue
+        .map(_latestCloudDetections)
+        .listen((d) {
+      if (!_liveMode) _activeDetectionsController.add(d);
+    });
     _tcpService.status.listen((s) {
       if (mounted) setState(() => _status = s);
     });
     _prefillDeviceIp();
+  }
+
+  /// Mirrors dashboard_page.dart's _navigateTo3DView coordinate mapping
+  /// (meters, sensor-centered -> room-corner-centered) so live cloud
+  /// updates land in the same place the initial snapshot did.
+  List<HumanDetection> _latestCloudDetections(DatabaseEvent event) {
+    final latest = latestFrameFromSnapshot(event.snapshot.value);
+    if (latest == null || latest['present'] != true) return const [];
+
+    return humanDetectionsFromFrameMap(latest).map((d) {
+      final cornerX = d.x + widget.roomLengthM / 2.0;
+      final cornerY = d.y + widget.roomWidthM / 2.0;
+      return HumanDetection(
+        id: d.id,
+        x: cornerX,
+        y: d.z,
+        z: cornerY,
+        posture: d.posture,
+        confidence: d.confidence,
+        velocity: d.velocity,
+      );
+    }).toList();
   }
 
   Future<void> _prefillDeviceIp() async {
@@ -107,6 +155,9 @@ class _Live3DViewPageState extends State<Live3DViewPage> {
 
   @override
   void dispose() {
+    _lanSub?.cancel();
+    _cloudSub?.cancel();
+    _activeDetectionsController.close();
     _tcpService.dispose();
     _ipController.dispose();
     super.dispose();
@@ -165,10 +216,42 @@ class _Live3DViewPageState extends State<Live3DViewPage> {
           ),
         ],
       ),
-      body: Column(
+      body: Stack(
+        // The WebView's native Android platform-view surface ghosts/splits
+        // when it gets RESIZED while live (a known webview_flutter hybrid-
+        // composition issue - the old surface isn't always torn down before
+        // the new one composites in, leaving the old frame visible behind
+        // the new one). A Column with a status bar above it shrinks the
+        // Expanded below whenever the bar appears/disappears, resizing the
+        // WebView on every LAN<->Cloud toggle and triggering exactly that.
+        // Using a Stack instead means Radar3DVisualization always fills the
+        // exact same constant-size area - it is never resized, so the
+        // surface is never re-composited, regardless of mode switches.
         children: [
-          if (_liveMode)
-            Container(
+          Positioned.fill(
+            child: Radar3DVisualization(
+              key: const ValueKey('radar_3d_visualization'),
+              roomLength: widget.roomLengthM,
+              roomWidth: widget.roomWidthM,
+              roomHeight: widget.roomHeightM,
+              humanDetections: _liveMode ? null : widget.cloudDetections,
+              livePointsStream: _liveMode ? _tcpService.frames : null,
+              liveDetectionsStream: _activeDetectionsController.stream,
+              showPointCloud: true,
+              showBoundingBoxes: true,
+              showLabels: true,
+            ),
+          ),
+          // Always visible (in both Live and Cloud mode) so the IP field and
+          // reconnect button stay reachable without first flipping the
+          // Switch back to Live - previously this only showed in Live mode,
+          // which made it look like the controls had vanished after
+          // switching to Cloud.
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: Container(
               width: double.infinity,
               padding: const EdgeInsets.all(8),
               color: Colors.grey[900],
@@ -180,38 +263,36 @@ class _Live3DViewPageState extends State<Live3DViewPage> {
                     margin: const EdgeInsets.only(right: 8),
                     decoration: BoxDecoration(shape: BoxShape.circle, color: _statusColor()),
                   ),
-                  Expanded(
-                    child: TextField(
-                      controller: _ipController,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: InputDecoration(
-                        labelText: 'Device IP',
-                        labelStyle: TextStyle(color: Colors.grey[400]),
-                        isDense: true,
+                  // The IP field + reconnect button only make sense in Live
+                  // (LAN) mode - showing them in Cloud mode let a tap on
+                  // refresh silently flip the Switch back to LAN, which
+                  // looked like a stuck/broken toggle. In Cloud mode just
+                  // show a compact "Cloud" label instead.
+                  if (_liveMode) ...[
+                    Expanded(
+                      child: TextField(
+                        controller: _ipController,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          labelText: 'Device IP',
+                          labelStyle: TextStyle(color: Colors.grey[400]),
+                          isDense: true,
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(_statusLabel(), style: TextStyle(color: _statusColor(), fontWeight: FontWeight.bold)),
-                  IconButton(
-                    icon: const Icon(Icons.refresh, color: Colors.white),
-                    onPressed: _goLive,
-                    tooltip: 'Reconnect',
-                  ),
+                    const SizedBox(width: 8),
+                    Text(_statusLabel(), style: TextStyle(color: _statusColor(), fontWeight: FontWeight.bold)),
+                    IconButton(
+                      icon: const Icon(Icons.refresh, color: Colors.white),
+                      onPressed: _goLive,
+                      tooltip: 'Reconnect',
+                    ),
+                  ] else
+                    const Expanded(
+                      child: Text('Cloud', style: TextStyle(color: Colors.white70)),
+                    ),
                 ],
               ),
-            ),
-          Expanded(
-            child: Radar3DVisualization(
-              roomLength: widget.roomLengthM,
-              roomWidth: widget.roomWidthM,
-              roomHeight: widget.roomHeightM,
-              humanDetections: _liveMode ? null : widget.cloudDetections,
-              livePointsStream: _liveMode ? _tcpService.frames : null,
-              liveDetectionsStream: _liveMode ? _liveDetectionsStream : null,
-              showPointCloud: true,
-              showBoundingBoxes: true,
-              showLabels: true,
             ),
           ),
         ],

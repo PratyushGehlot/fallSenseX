@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'dart:async';
+import '../models/radar_models.dart';
 import '../widgets/room_3d_view.dart' as view2d;
 import '../widgets/radar_3d_visualization.dart' as view3d;
 import '../widgets/room_3d_replay.dart';
@@ -30,7 +31,11 @@ class _DashboardPageState extends State<DashboardPage> {
   bool _isDeviceOnline = true;
   bool _wasOnline = true;
   DateTime? _lastHeartbeatTime;
-  static const Duration OFFLINE_TIMEOUT = Duration(seconds: 30);
+  // Must comfortably exceed the firmware's worst-case heartbeat gap: a
+  // single retry backoff cycle (heartbeat_backoff_ms in
+  // fall_sense_x_main.c) can push the next heartbeat out to 60s after one
+  // transient failure, even though the device is still actually online.
+  static const Duration OFFLINE_TIMEOUT = Duration(seconds: 75);
 
   double _roomLength = 10.0;
   double _roomWidth = 10.0;
@@ -242,30 +247,26 @@ class _DashboardPageState extends State<DashboardPage> {
       final present = latestFrame['present'] as bool? ?? false;
 
       if (present) {
-        final xMeters = (latestFrame['x'] as num?)?.toDouble() ?? 0.0;
-        final yMeters = (latestFrame['y'] as num?)?.toDouble() ?? 0.0;
-        final zMeters = (latestFrame['z'] as num?)?.toDouble() ?? 0.0;
-        final posture = latestFrame['posture']?.toString() ?? 'UNKNOWN';
-        final confidence = (latestFrame['confidence'] as num?)?.toDouble() ?? 1.0;
-        final velocity = (latestFrame['velocity'] as num?)?.toDouble() ?? 0.0;
-
         final roomLenM = _roomLength / 3.28084;
         final roomWidM = _roomWidth / 3.28084;
-        final cornerX = xMeters + roomLenM / 2.0;
-        final cornerY = yMeters + roomWidM / 2.0;
 
-        detections.add(view3d.HumanDetection(
-          id: 'H1',
-          x: cornerX,
-          y: zMeters,
-          z: cornerY,
-          width: 0.6,
-          height: 1.8,
-          depth: 0.4,
-          posture: posture,
-          confidence: confidence,
-          velocity: velocity,
-        ));
+        for (final d in humanDetectionsFromFrameMap(latestFrame)) {
+          final cornerX = d.x + roomLenM / 2.0;
+          final cornerY = d.y + roomWidM / 2.0;
+
+          detections.add(view3d.HumanDetection(
+            id: d.id,
+            x: cornerX,
+            y: d.z,
+            z: cornerY,
+            width: 0.6,
+            height: 1.8,
+            depth: 0.4,
+            posture: d.posture,
+            confidence: d.confidence,
+            velocity: d.velocity,
+          ));
+        }
       }
     }
 
@@ -551,20 +552,14 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Widget _buildLatestFrameCard(Map<String, dynamic> frame) {
-    final posture = frame['posture']?.toString() ?? 'Unknown';
     final present = frame['present'] as bool? ?? false;
-    final confidence = (frame['confidence'] as num?)?.toDouble() ?? 0.0;
-    final velocity = (frame['velocity'] as num?)?.toDouble() ?? 0.0;
-    final xMeters = (frame['x'] as num?)?.toDouble() ?? 0.0;
-    final yMeters = (frame['y'] as num?)?.toDouble() ?? 0.0;
-    final zMeters = (frame['z'] as num?)?.toDouble() ?? 0.0;
-    final xFeet = xMeters * 3.28084;
-    final yFeet = yMeters * 3.28084;
+    final detections = humanDetectionsFromFrameMap(frame);
     final timestamp = frame['timestamp'] ?? frame['timestamp_ms'] ?? 'N/A';
     final formattedTimestamp = _formatTimestamp(timestamp);
+    final headerPosture = detections.isNotEmpty ? detections.first.posture : 'Unknown';
 
     return Card(
-      color: _getPostureColor(posture).withOpacity(0.1),
+      color: _getPostureColor(headerPosture).withOpacity(0.1),
       elevation: 4,
       child: Padding(
         padding: const EdgeInsets.all(16.0),
@@ -573,52 +568,57 @@ class _DashboardPageState extends State<DashboardPage> {
           children: [
             Row(
               children: [
-                Text(_getPostureEmoji(posture), style: const TextStyle(fontSize: 32)),
+                Text(_getPostureEmoji(headerPosture), style: const TextStyle(fontSize: 32)),
                 const SizedBox(width: 16),
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Posture: $posture',
-                        style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                          color: _getPostureColor(posture),
-                        ),
-                      ),
-                      Text(
-                        present ? '✓ Present' : '✗ Not Present',
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: present ? Colors.green : Colors.red,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: Colors.deepPurple.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
                   child: Text(
-                    'Conf: ${(confidence * 100).toStringAsFixed(0)}%',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
+                    present
+                        ? '${detections.length} ${detections.length == 1 ? 'person' : 'people'} detected'
+                        : 'No one present',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: present ? Colors.green : Colors.red,
+                    ),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                _buildInfoChip('Velocity', '${velocity.toStringAsFixed(2)} m/s', Icons.speed),
-                const SizedBox(width: 12),
-                _buildInfoChip('Position', '(${xFeet.toStringAsFixed(1)}, ${yFeet.toStringAsFixed(1)}) ft', Icons.location_on),
-              ],
-            ),
-            const SizedBox(height: 8),
+            for (final d in detections) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '${d.posture} (#${d.id})',
+                      style: TextStyle(fontWeight: FontWeight.bold, color: _getPostureColor(d.posture)),
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.deepPurple.withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      'Conf: ${(d.confidence * 100).toStringAsFixed(0)}%',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  _buildInfoChip('Velocity', '${d.velocity.toStringAsFixed(2)} m/s', Icons.speed),
+                  const SizedBox(width: 12),
+                  _buildInfoChip('Position',
+                      '(${(d.x * 3.28084).toStringAsFixed(1)}, ${(d.y * 3.28084).toStringAsFixed(1)}) ft',
+                      Icons.location_on),
+                ],
+              ),
+              const SizedBox(height: 8),
+            ],
             if (_latestTemperature != null)
               Row(
                 children: [
@@ -637,26 +637,27 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Widget _buildFrameCard(Map<String, dynamic> frame, int index) {
-    final posture = frame['posture']?.toString() ?? 'Unknown';
     final present = frame['present'] as bool? ?? false;
-    final confidence = (frame['confidence'] as num?)?.toDouble() ?? 0.0;
+    final detections = humanDetectionsFromFrameMap(frame);
     final timestamp = frame['timestamp'] ?? frame['timestamp_ms'] ?? 'N/A';
     final formattedTimestamp = _formatTimestamp(timestamp);
+    final headerPosture = detections.isNotEmpty ? detections.first.posture : 'Unknown';
+    final subtitle = !present
+        ? 'Not present'
+        : detections.map((d) => '${d.posture} (${(d.confidence * 100).toStringAsFixed(0)}%)').join(' · ');
 
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       child: ListTile(
-        leading: Text(_getPostureEmoji(posture), style: const TextStyle(fontSize: 24)),
+        leading: Text(_getPostureEmoji(headerPosture), style: const TextStyle(fontSize: 24)),
         title: Text(
-          posture,
+          present ? '${detections.length} ${detections.length == 1 ? 'person' : 'people'}' : 'No one present',
           style: TextStyle(
             fontWeight: FontWeight.bold,
-            color: _getPostureColor(posture),
+            color: _getPostureColor(headerPosture),
           ),
         ),
-        subtitle: Text(
-          present ? 'Present • ${(confidence * 100).toStringAsFixed(0)}% confidence' : 'Not present',
-        ),
+        subtitle: Text(subtitle),
         trailing: Text(
           formattedTimestamp,
           style: const TextStyle(fontSize: 12, color: Colors.grey),

@@ -69,7 +69,13 @@ class _Radar3DVisualizationState extends State<Radar3DVisualization> {
 
   void _subscribeToLiveStream() {
     _liveSubscription?.cancel();
-    if (widget.livePointsStream == null) return;
+    if (widget.livePointsStream == null) {
+      // Cloud mode has no raw point-cloud feed - without this the last LAN
+      // frame's points stay rendered forever, frozen on top of the Cloud
+      // view after switching away from Live.
+      updatePoints(const []);
+      return;
+    }
     _liveSubscription = widget.livePointsStream!.listen(updatePoints);
   }
 
