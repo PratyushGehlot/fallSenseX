@@ -18,6 +18,7 @@ dependencies:
   firebase_auth: ^4.9.0
   firebase_database: ^10.4.0
   firebase_messaging: ^14.9.0
+  google_sign_in: ^6.2.1
 
   # Local notifications
   flutter_local_notifications: ^17.0.0
@@ -28,6 +29,15 @@ dependencies:
   # 3D visualization via WebView + Three.js
   webview_flutter: ^4.13.1
 
+  # BLE scanning for the Add Device flow (UI only for now - the device
+  # firmware doesn't advertise a BLE provisioning service yet, see
+  # lib/pages/add_device_page.dart)
+  flutter_blue_plus: ^1.32.12
+
+  # LAN calls to the device's local web server (posture calibration - see
+  # lib/pages/posture_calibration_page.dart)
+  http: ^1.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -37,3 +47,9 @@ flutter:
   uses-material-design: true
   assets:
     - assets/radar_3d.html
+    - assets/images/device_photo.png
+    - assets/images/logo.png
+    - assets/images/login_header.png
+    - assets/images/room_isometric.png
+    - assets/images/live_view_placeholder.jpg
+    - assets/images/google_icon.png

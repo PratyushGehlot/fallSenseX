@@ -1,9 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Permission for Android 13+ (API 33+) to show notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-    
+
+    <!-- BLE scanning for the Add Device flow (see add_device_page.dart).
+         neverForLocation: the scan is only used to find nearby FallSenseX
+         devices, never to derive the phone's physical location. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+
     <application
-        android:label="fall_sense_x_mobile"
+        android:label="FallSenseX"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         

@@ -28,6 +28,10 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>FallSenseX connects to your radar device over your local WiFi network to stream live point-cloud data for debugging.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>FallSenseX scans for nearby sensors over Bluetooth so you can add them in the Add Device screen.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>FallSenseX scans for nearby sensors over Bluetooth so you can add them in the Add Device screen.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -589,12 +589,23 @@ esp_err_t firebase_post_heartbeat(uint32_t timestamp, uint32_t timestamp_ms)
                  s_firebase.device_id);
     }
 
-    char json_payload[128];
+    /* RSSI piggybacks on the existing heartbeat PUT rather than a separate
+     * request, so the app's Wi-Fi Strength reading is only ever as fresh as
+     * the last heartbeat (every HEARTBEAT_INTERVAL_MS) - that's fine since
+     * signal strength doesn't need to be more real-time than online status. */
+    wifi_ap_record_t ap_info;
+    int8_t rssi = -127;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = ap_info.rssi;
+    }
+
+    char json_payload[160];
     int json_len = snprintf(json_payload, sizeof(json_payload),
-        "{\"timestamp\":%lu,\"timestamp_ms\":%lu,\"value\":true,\"device_id\":\"%s\"}",
+        "{\"timestamp\":%lu,\"timestamp_ms\":%lu,\"value\":true,\"device_id\":\"%s\",\"rssi\":%d}",
         timestamp,
         timestamp_ms,
-        s_firebase.device_id);
+        s_firebase.device_id,
+        (int)rssi);
 
     if (json_len <= 0 || json_len >= sizeof(json_payload)) {
         ESP_LOGE(TAG, "Failed to build heartbeat JSON payload");
@@ -785,6 +796,23 @@ firebase_command_t firebase_check_for_reset_command(void)
         }
     }
     return FIREBASE_CMD_NONE;
+}
+
+bool firebase_get_status_led_enabled(void)
+{
+    char value[16] = {0};
+    char path[128];
+    snprintf(path, sizeof(path), "devices/%s/uiPrefs/statusLedEnabled", s_firebase.device_id);
+
+    if (firebase_get_command(path, value, sizeof(value)) == ESP_OK) {
+        /* "null" is what RTDB returns for a path that was never written -
+         * default to on so devices that predate this preference keep their
+         * existing behavior. */
+        if (strcmp(value, "false") == 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 esp_err_t firebase_post_ota_status(const char *state, int progress, const char *error)

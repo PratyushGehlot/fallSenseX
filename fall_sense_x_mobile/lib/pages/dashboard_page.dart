@@ -3,13 +3,13 @@ import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'dart:async';
 import '../models/radar_models.dart';
-import '../widgets/room_3d_view.dart' as view2d;
-import '../widgets/radar_3d_visualization.dart' as view3d;
-import '../widgets/room_3d_replay.dart';
-import 'live_3d_view_page.dart';
+import 'live_monitor_page.dart';
 import 'package:fall_sense_x_mobile/services/notification_service.dart';
 import 'package:fall_sense_x_mobile/services/auth_service.dart';
 import 'package:fall_sense_x_mobile/services/ota_service.dart';
+import '../theme/app_theme.dart';
+import 'device_settings_page.dart';
+import 'detection_trends_page.dart';
 
 class DashboardPage extends StatefulWidget {
   final String deviceId;
@@ -37,21 +37,9 @@ class _DashboardPageState extends State<DashboardPage> {
   // transient failure, even though the device is still actually online.
   static const Duration OFFLINE_TIMEOUT = Duration(seconds: 75);
 
-  double _roomLength = 10.0;
-  double _roomWidth = 10.0;
-  double _roomHeight = 8.0;
-
-  StreamSubscription<DatabaseEvent>? _infoSubscription;
-  StreamSubscription<DatabaseEvent>? _manifestSubscription;
-  String? _currentFirmwareVersion;
-  String _deviceModel = 'fallsensex';
-  String? _latestFirmwareVersion;
-  String? _latestFirmwareUrl;
-
-  bool get _updateAvailable =>
-      _currentFirmwareVersion != null &&
-      _latestFirmwareVersion != null &&
-      OtaService.compareVersions(_latestFirmwareVersion!, _currentFirmwareVersion!) > 0;
+  final double _roomLength = 10.0;
+  final double _roomWidth = 10.0;
+  final double _roomHeight = 8.0;
 
   @override
   void initState() {
@@ -60,7 +48,6 @@ class _DashboardPageState extends State<DashboardPage> {
     _onlineRef = FirebaseDatabase.instance.ref('devices/${widget.deviceId}/online');
     _startRealTimeUpdates();
     _startOnlineMonitoring();
-    _startFirmwareVersionMonitoring();
     NotificationService.requestPermissions();
 
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
@@ -88,55 +75,20 @@ class _DashboardPageState extends State<DashboardPage> {
   void dispose() {
     _subscription?.cancel();
     _onlineSubscription?.cancel();
-    _infoSubscription?.cancel();
-    _manifestSubscription?.cancel();
     super.dispose();
   }
 
-  void _startFirmwareVersionMonitoring() {
-    _infoSubscription = OtaService.infoRef(widget.deviceId).onValue.listen((event) {
-      if (!mounted) return;
-      final data = event.snapshot.value;
-      if (data is Map) {
-        final version = data['firmwareVersion']?.toString();
-        final model = data['deviceModel']?.toString();
-        setState(() {
-          _currentFirmwareVersion = version;
-          if (model != null && model.isNotEmpty) {
-            _deviceModel = model;
-          }
-        });
-        _manifestSubscription?.cancel();
-        _manifestSubscription = OtaService.manifestRef(_deviceModel).onValue.listen((manifestEvent) {
-          if (!mounted) return;
-          final manifest = manifestEvent.snapshot.value;
-          if (manifest is Map) {
-            setState(() {
-              _latestFirmwareVersion = manifest['version']?.toString();
-              _latestFirmwareUrl = manifest['url']?.toString();
-            });
-          }
-        });
-      }
-    });
-  }
-
-  void _showOtaSheet() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      builder: (context) => _OtaUpdateSheet(
-        deviceId: widget.deviceId,
-        currentVersion: _currentFirmwareVersion ?? 'unknown',
-        latestVersion: _latestFirmwareVersion,
-        latestUrl: _latestFirmwareUrl,
-        updateAvailable: _updateAvailable,
-      ),
-    );
-  }
-
+  /// Skips subscribing if the user explicitly muted fall alerts for this
+  /// device (device_alerts_page.dart / notification_settings_page.dart) -
+  /// otherwise just opening the dashboard would silently re-subscribe a
+  /// device the user had muted.
   Future<void> _subscribeToDeviceAlerts() async {
     try {
+      final prefSnapshot = await FirebaseDatabase.instance.ref('devices/${widget.deviceId}/alertPrefs/fallAlerts').get();
+      if (prefSnapshot.exists && prefSnapshot.value == false) {
+        debugPrint('Skipping alert subscription for ${widget.deviceId} - muted by user');
+        return;
+      }
       await FirebaseMessaging.instance.subscribeToTopic('device_${widget.deviceId}_alerts');
       debugPrint('Subscribed to device_${widget.deviceId}_alerts topic');
     } catch (e) {
@@ -231,58 +183,38 @@ class _DashboardPageState extends State<DashboardPage> {
     final wentOffline = !isOnline && _wasOnline;
     _wasOnline = isOnline;
     if (wentOffline) {
-      NotificationService.showNotification(
-        title: 'Device Offline',
-        body: 'FallSenseX device is not responding. Check power and internet connection.',
-        notificationId: 9999,
-      );
+      _maybeShowOfflineNotification();
     }
   }
 
-  void _navigateTo3DView() {
-    List<view3d.HumanDetection> detections = [];
-
-    if (_frames.isNotEmpty) {
-      final latestFrame = _frames.last;
-      final present = latestFrame['present'] as bool? ?? false;
-
-      if (present) {
-        final roomLenM = _roomLength / 3.28084;
-        final roomWidM = _roomWidth / 3.28084;
-
-        for (final d in humanDetectionsFromFrameMap(latestFrame)) {
-          final cornerX = d.x + roomLenM / 2.0;
-          final cornerY = d.y + roomWidM / 2.0;
-
-          detections.add(view3d.HumanDetection(
-            id: d.id,
-            x: cornerX,
-            y: d.z,
-            z: cornerY,
-            width: 0.6,
-            height: 1.8,
-            depth: 0.4,
-            posture: d.posture,
-            confidence: d.confidence,
-            velocity: d.velocity,
-          ));
-        }
-      }
+  /// Respects the "Offline Alerts" toggle in notification_settings_page.dart
+  /// - defaults to on (matches that page's default) if the user has never
+  /// visited Notification Settings.
+  Future<void> _maybeShowOfflineNotification() async {
+    final uid = AuthService().currentUser()?.uid;
+    if (uid != null) {
+      final snapshot = await FirebaseDatabase.instance.ref('users/$uid/notificationPrefs/offlineAlerts').get();
+      if (snapshot.exists && snapshot.value == false) return;
     }
+    NotificationService.showNotification(
+      title: 'Device Offline',
+      body: 'FallSenseX device is not responding. Check power and internet connection.',
+      notificationId: 9999,
+    );
+  }
 
-    final roomLengthMeters = _roomLength / 3.28084;
-    final roomWidthMeters = _roomWidth / 3.28084;
-    final roomHeightMeters = _roomHeight / 3.28084;
-
+  /// 2D/3D View both open the unified LiveMonitorPage (pill-toggle screen
+  /// matching the premium reference), just defaulting to a different tab.
+  void _navigateTo3DView() {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => Live3DViewPage(
+        builder: (context) => LiveMonitorPage(
           deviceId: widget.deviceId,
-          cloudDetections: detections,
-          roomLengthM: roomLengthMeters,
-          roomWidthM: roomWidthMeters,
-          roomHeightM: roomHeightMeters,
+          initialTab: 1,
+          roomLengthFt: _roomLength,
+          roomWidthFt: _roomWidth,
+          roomHeightFt: _roomHeight,
         ),
       ),
     );
@@ -292,77 +224,13 @@ class _DashboardPageState extends State<DashboardPage> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => view2d.Room3DView(
-          frames: _frames,
-          roomLength: _roomLength,
-          roomWidth: _roomWidth,
-          roomHeight: _roomHeight,
-          framesRef: _framesRef,
-        ),
-      ),
-    );
-  }
-
-  void _navigateToReplay() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => Room3DReplay(
+        builder: (context) => LiveMonitorPage(
           deviceId: widget.deviceId,
-          roomLength: _roomLength,
-          roomWidth: _roomWidth,
-          roomHeight: _roomHeight,
+          initialTab: 0,
+          roomLengthFt: _roomLength,
+          roomWidthFt: _roomWidth,
+          roomHeightFt: _roomHeight,
         ),
-      ),
-    );
-  }
-
-  void _showRoomConfigDialog() {
-    final lengthController = TextEditingController(text: _roomLength.toString());
-    final widthController = TextEditingController(text: _roomWidth.toString());
-    final heightController = TextEditingController(text: _roomHeight.toString());
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Room Configuration (feet)'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: lengthController,
-              decoration: const InputDecoration(labelText: 'Length (X)'),
-              keyboardType: TextInputType.number,
-            ),
-            TextField(
-              controller: widthController,
-              decoration: const InputDecoration(labelText: 'Width (Y)'),
-              keyboardType: TextInputType.number,
-            ),
-            TextField(
-              controller: heightController,
-              decoration: const InputDecoration(labelText: 'Height (Z)'),
-              keyboardType: TextInputType.number,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              setState(() {
-                _roomLength = double.tryParse(lengthController.text) ?? _roomLength;
-                _roomWidth = double.tryParse(widthController.text) ?? _roomWidth;
-                _roomHeight = double.tryParse(heightController.text) ?? _roomHeight;
-              });
-              Navigator.pop(context);
-            },
-            child: const Text('Save'),
-          ),
-        ],
       ),
     );
   }
@@ -411,15 +279,10 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
-  Future<void> _signOut() async {
-    await AuthService().signOut();
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: Row(
           children: [
             Expanded(child: Text('Device: ${widget.deviceId}')),
@@ -435,54 +298,23 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
           ],
         ),
+        // 2D/3D view, Replay and Configure Room are all reachable from
+        // inside LiveMonitorPage (opened by the 3D View icon below), and
+        // signing out already lives in the Settings tab - so the only two
+        // actions that need to stay here are 3D View and Device Settings.
         actions: [
-          IconButton(
-            icon: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                const Icon(Icons.system_update),
-                if (_updateAvailable)
-                  Positioned(
-                    right: -2,
-                    top: -2,
-                    child: Container(
-                      width: 8,
-                      height: 8,
-                      decoration: const BoxDecoration(
-                        color: Colors.red,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            onPressed: _showOtaSheet,
-            tooltip: _updateAvailable ? 'Update available' : 'Firmware version',
-          ),
           IconButton(
             icon: const Icon(Icons.view_in_ar),
             onPressed: _navigateTo3DView,
             tooltip: '3D View',
           ),
           IconButton(
-            icon: const Icon(Icons.map),
-            onPressed: _navigateTo2DView,
-            tooltip: '2D View',
-          ),
-          IconButton(
-            icon: const Icon(Icons.replay),
-            onPressed: _navigateToReplay,
-            tooltip: 'Replay',
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: _showRoomConfigDialog,
-            tooltip: 'Configure Room',
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: _signOut,
-            tooltip: 'Sign Out',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => DeviceSettingsPage(deviceId: widget.deviceId)),
+            ),
+            tooltip: 'Device Settings',
           ),
         ],
       ),
@@ -495,16 +327,38 @@ class _DashboardPageState extends State<DashboardPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      if (_frames.isNotEmpty) _buildLatestFrameCard(_frames.last),
+                      _buildDeviceIdentityHeader(),
                       const SizedBox(height: 16),
-                      Text(
-                        'Frame History (${_frames.length} entries)',
-                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      _buildSystemStatusCard(),
+                      const SizedBox(height: 16),
+                      _buildLiveViewCard(_frames.isNotEmpty ? _frames.last : null),
+                      if (_frames.isNotEmpty)
+                        Theme(
+                          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                          child: ExpansionTile(
+                            tilePadding: EdgeInsets.zero,
+                            title: const Text('Detection Details', style: TextStyle(fontSize: 13, color: AppColors.textSecondary)),
+                            children: [_buildLatestFrameCard(_frames.last)],
+                          ),
+                        ),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Recent Events', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                          TextButton(
+                            onPressed: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (_) => DetectionTrendsPage(deviceId: widget.deviceId)),
+                            ),
+                            child: const Text('View All'),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 8),
                       Expanded(
                         child: Scrollbar(
                           child: ListView.builder(
+                            padding: EdgeInsets.only(bottom: MediaQuery.of(context).padding.bottom),
                             itemCount: _frames.length,
                             itemBuilder: (context, index) {
                               final frame = _frames[_frames.length - 1 - index];
@@ -547,6 +401,295 @@ class _DashboardPageState extends State<DashboardPage> {
             label: const Text('Retry'),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Device identity block mirroring the premium reference's Device Page
+  /// header: thumbnail, name, mount description, and online status dot.
+  Widget _buildDeviceIdentityHeader() {
+    return Row(
+      children: [
+        Container(
+          width: 56,
+          height: 56,
+          decoration: BoxDecoration(
+            gradient: AppColors.heroGradient,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: const Icon(Icons.sensors, color: Colors.white, size: 28),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(widget.deviceId, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 2),
+              const Text('Ceiling Mount · Live Monitoring', style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _isDeviceOnline ? AppColors.statusOnline : AppColors.statusOffline,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isDeviceOnline ? 'Device Online' : 'Device Offline',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: _isDeviceOnline ? AppColors.statusOnline : AppColors.statusOffline,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// "Live View" card mirroring the premium reference: since FallSenseX is a
+  /// radar sensor with no camera, there's no real photo feed - this shows an
+  /// abstract radar-sweep graphic in the same layout (image area + status
+  /// pills) rather than pretending to be a literal camera preview.
+  Widget _buildLiveViewCard(Map<String, dynamic>? latestFrame) {
+    final detections = latestFrame != null ? humanDetectionsFromFrameMap(latestFrame) : <HumanDetection>[];
+    final present = latestFrame?['present'] as bool? ?? false;
+    final posture = detections.isNotEmpty ? detections.first.posture : null;
+    final hasFallen = detections.any((d) => d.posture.toUpperCase() == 'FALL');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('Live View', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            Row(
+              children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: const BoxDecoration(shape: BoxShape.circle, color: AppColors.statusOnline),
+                ),
+                const SizedBox(width: 4),
+                const Text('Updated just now', style: TextStyle(fontSize: 11, color: AppColors.textSecondary)),
+              ],
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                flex: 3,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: _navigateTo2DView,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: SizedBox(
+                      height: 180,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          // Illustrative room photo, not the device's actual
+                          // camera feed (the sensor is radar-only, no
+                          // camera) - the figure overlay reflects the real
+                          // latest detection's posture/presence though.
+                          Image.asset('assets/images/live_view_placeholder.jpg', fit: BoxFit.cover),
+                          if (present)
+                            Center(
+                              child: Icon(
+                                Icons.accessibility_new,
+                                size: 72,
+                                color: hasFallen ? AppColors.statusFall : AppColors.accent,
+                              ),
+                            ),
+                          Positioned(
+                            left: 10,
+                            bottom: 10,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.55), borderRadius: BorderRadius.circular(10)),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Container(width: 6, height: 6, decoration: const BoxDecoration(shape: BoxShape.circle, color: AppColors.statusOnline)),
+                                  const SizedBox(width: 5),
+                                  const Text('Live', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600)),
+                                ],
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            right: 10,
+                            bottom: 10,
+                            child: Container(
+                              width: 28,
+                              height: 28,
+                              decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.92), shape: BoxShape.circle),
+                              child: const Icon(Icons.open_in_full, size: 14, color: AppColors.textPrimary),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                flex: 2,
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: _buildLiveViewChip(
+                        Icons.accessibility_new,
+                        AppColors.statusOnline,
+                        present ? (posture ?? 'Standing') : 'No One',
+                        present ? 'Good Posture' : 'Detected',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: _buildLiveViewChip(
+                        Icons.shield_outlined,
+                        hasFallen ? AppColors.statusFall : AppColors.accent,
+                        hasFallen ? 'Fall' : 'No Fall',
+                        'Detected',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: _buildLiveViewChip(Icons.favorite_border, AppColors.accent, 'Normal', 'Activity'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLiveViewChip(IconData icon, Color color, String title, String subtitle) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(12)),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(title, style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: color), maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text(subtitle, style: const TextStyle(fontSize: 9, color: AppColors.textSecondary), maxLines: 1, overflow: TextOverflow.ellipsis),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// "System Status" hero card mirroring the premium reference's Device
+  /// Page: All Good / person-detected summary plus quick capability chips.
+  Widget _buildSystemStatusCard() {
+    final detections = _frames.isNotEmpty ? humanDetectionsFromFrameMap(_frames.last) : <HumanDetection>[];
+    final hasFallen = detections.any((d) => d.posture.toUpperCase() == 'FALL');
+    final present = _frames.isNotEmpty && (_frames.last['present'] as bool? ?? false);
+    final allGood = !hasFallen;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: allGood ? AppColors.accentLight : AppColors.statusFall.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                allGood ? Icons.check_circle : Icons.warning_amber_rounded,
+                color: allGood ? AppColors.statusOnline : AppColors.statusFall,
+                size: 28,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      allGood ? 'All Good' : 'Fall Detected',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: allGood ? AppColors.statusOnline : AppColors.statusFall,
+                      ),
+                    ),
+                    Text('Monitoring is active', style: const TextStyle(fontSize: 12, color: AppColors.textSecondary)),
+                  ],
+                ),
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Icon(Icons.people_outline, size: 18, color: AppColors.textSecondary),
+                  Text(present ? '${detections.length}' : '0', style: const TextStyle(fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            _buildCapabilityChip(Icons.accessibility_new, 'Posture Tracking', _isDeviceOnline ? 'Active' : 'Idle'),
+            const SizedBox(width: 8),
+            _buildCapabilityChip(Icons.directions_run, 'Fall Detection', _isDeviceOnline ? 'Active' : 'Idle'),
+            const SizedBox(width: 8),
+            _buildCapabilityChip(Icons.notifications_active_outlined, 'Alerts', 'Enabled'),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCapabilityChip(IconData icon, String label, String value) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+        decoration: BoxDecoration(
+          color: AppColors.card,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFFE5E5EA)),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, size: 18, color: AppColors.accent),
+            const SizedBox(height: 4),
+            Text(label, textAlign: TextAlign.center, style: const TextStyle(fontSize: 10, color: AppColors.textSecondary)),
+            Text(value, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+          ],
+        ),
       ),
     );
   }
@@ -636,32 +779,43 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
+  /// Recent-events row styled like the premium reference: a colored
+  /// check/info/warning icon circle, title + "time · context" subtitle.
   Widget _buildFrameCard(Map<String, dynamic> frame, int index) {
     final present = frame['present'] as bool? ?? false;
     final detections = humanDetectionsFromFrameMap(frame);
     final timestamp = frame['timestamp'] ?? frame['timestamp_ms'] ?? 'N/A';
     final formattedTimestamp = _formatTimestamp(timestamp);
-    final headerPosture = detections.isNotEmpty ? detections.first.posture : 'Unknown';
-    final subtitle = !present
-        ? 'Not present'
-        : detections.map((d) => '${d.posture} (${(d.confidence * 100).toStringAsFixed(0)}%)').join(' · ');
+    final hasFallen = detections.any((d) => d.posture.toUpperCase() == 'FALL');
+
+    final String title;
+    final IconData icon;
+    final Color color;
+    if (hasFallen) {
+      title = 'Fall Detected';
+      icon = Icons.warning_amber_rounded;
+      color = AppColors.statusFall;
+    } else if (present) {
+      title = 'Person Detected';
+      icon = Icons.info_outline;
+      color = AppColors.statusPresence;
+    } else {
+      title = 'Normal Activity';
+      icon = Icons.check_circle_outline;
+      color = AppColors.statusOnline;
+    }
 
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       child: ListTile(
-        leading: Text(_getPostureEmoji(headerPosture), style: const TextStyle(fontSize: 24)),
-        title: Text(
-          present ? '${detections.length} ${detections.length == 1 ? 'person' : 'people'}' : 'No one present',
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            color: _getPostureColor(headerPosture),
-          ),
+        leading: CircleAvatar(
+          radius: 16,
+          backgroundColor: color.withValues(alpha: 0.12),
+          child: Icon(icon, size: 16, color: color),
         ),
-        subtitle: Text(subtitle),
-        trailing: Text(
-          formattedTimestamp,
-          style: const TextStyle(fontSize: 12, color: Colors.grey),
-        ),
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+        subtitle: Text(formattedTimestamp, style: const TextStyle(fontSize: 12, color: AppColors.textSecondary)),
+        trailing: const Icon(Icons.chevron_right, color: AppColors.textSecondary),
       ),
     );
   }
@@ -695,17 +849,18 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 }
 
-/// Bottom sheet shown from the dashboard app bar: current vs latest firmware
-/// version, an "Update Now" button, and a live progress view once an update
-/// has been triggered (driven by /devices/{deviceId}/ota_status).
-class _OtaUpdateSheet extends StatefulWidget {
+/// Bottom sheet showing current vs latest firmware version, an "Update Now"
+/// button, and a live progress view once an update has been triggered
+/// (driven by /devices/{deviceId}/ota_status). Shared by dashboard_page.dart
+/// and device_settings_page.dart's Firmware Version tile.
+class OtaUpdateSheet extends StatefulWidget {
   final String deviceId;
   final String currentVersion;
   final String? latestVersion;
   final String? latestUrl;
   final bool updateAvailable;
 
-  const _OtaUpdateSheet({
+  const OtaUpdateSheet({
     required this.deviceId,
     required this.currentVersion,
     required this.latestVersion,
@@ -714,10 +869,10 @@ class _OtaUpdateSheet extends StatefulWidget {
   });
 
   @override
-  State<_OtaUpdateSheet> createState() => _OtaUpdateSheetState();
+  State<OtaUpdateSheet> createState() => _OtaUpdateSheetState();
 }
 
-class _OtaUpdateSheetState extends State<_OtaUpdateSheet> {
+class _OtaUpdateSheetState extends State<OtaUpdateSheet> {
   StreamSubscription<DatabaseEvent>? _statusSubscription;
   String? _state;
   int _progress = 0;

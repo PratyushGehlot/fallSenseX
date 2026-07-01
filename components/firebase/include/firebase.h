@@ -230,6 +230,15 @@ esp_err_t firebase_trim_frames(int max_frames);
 esp_err_t firebase_clear_command(const char *command_path);
 
 /**
+ * @brief Read /devices/{deviceId}/uiPrefs/statusLedEnabled from Firebase.
+ * @details Unlike the reset/OTA commands, this is read (not cleared) on every
+ *          poll cycle so the LED state survives a reboot - app onboard
+ *          default is "on" if the field has never been written.
+ * @return true if the status LED should be on, false if it should be off
+ */
+bool firebase_get_status_led_enabled(void);
+
+/**
  * @brief Read the ESP32-S3 internal CPU temperature sensor
  * @return Temperature in Celsius, or 0.0f if the sensor could not be read
  */

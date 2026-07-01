@@ -1,11 +1,13 @@
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'dart:math';
 
 class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final DatabaseReference _usersRef = FirebaseDatabase.instance.ref('users');
+  final GoogleSignIn _googleSignIn = GoogleSignIn(scopes: ['email']);
 
   Future<User?> signIn(String email, String password) async {
     try {
@@ -16,6 +18,14 @@ class AuthService {
       return result.user;
     } catch (e) {
       throw Exception('Login failed: $e');
+    }
+  }
+
+  Future<void> sendPasswordReset(String email) async {
+    try {
+      await _auth.sendPasswordResetEmail(email: email);
+    } catch (e) {
+      throw Exception('Could not send reset email: $e');
     }
   }
 
@@ -39,7 +49,40 @@ class AuthService {
     }
   }
 
+  /// Throws a plain string (not Exception) for the one expected
+  /// non-error case - the user closing the Google account picker - so
+  /// callers can tell "user cancelled" apart from a real failure.
+  Future<User?> signInWithGoogle() async {
+    try {
+      final googleUser = await _googleSignIn.signIn();
+      if (googleUser == null) {
+        throw 'cancelled';
+      }
+      final googleAuth = await googleUser.authentication;
+      final credential = GoogleAuthProvider.credential(
+        accessToken: googleAuth.accessToken,
+        idToken: googleAuth.idToken,
+      );
+      final result = await _auth.signInWithCredential(credential);
+      final user = result.user;
+      if (user != null && (result.additionalUserInfo?.isNewUser ?? false)) {
+        await _usersRef.child(user.uid).set({
+          'name': user.displayName ?? user.email?.split('@').first ?? 'User',
+          'email': user.email,
+          'createdAt': DateTime.now().millisecondsSinceEpoch,
+        });
+      }
+      return user;
+    } catch (e) {
+      if (e == 'cancelled') rethrow;
+      throw Exception('Google sign-in failed: $e');
+    }
+  }
+
   Future<void> signOut() async {
+    if (await _googleSignIn.isSignedIn()) {
+      await _googleSignIn.signOut();
+    }
     await _auth.signOut();
   }
 
@@ -115,14 +158,107 @@ class DeviceService {
     return true;
   }
 
-  Future<void> shareDevice(String deviceId, String targetUid) async {
+  /// [permissionLevel] is one of 'view' | 'manage' | 'full' (see
+  /// share_device_page.dart's Permission Levels section). It's recorded for
+  /// display and for future enforcement - today every shared user can
+  /// already view the device the same way regardless of level, since the
+  /// app doesn't yet gate any screens by it.
+  Future<void> shareDevice(String deviceId, String targetUid, {String? targetEmail, String permissionLevel = 'view'}) async {
     // Only the owner can share; we assume the caller has verified ownership
     await _devicesRef.child(deviceId).child('sharedWith').child(targetUid).set(true);
+    await _devicesRef.child(deviceId).child('sharedPermissions').child(targetUid).set(permissionLevel);
+    if (targetEmail != null && targetEmail.isNotEmpty) {
+      await _devicesRef.child(deviceId).child('sharedWithEmails').child(targetUid).set(targetEmail);
+    }
+  }
+
+  Future<void> setSharePermission(String deviceId, String targetUid, String permissionLevel) async {
+    await _devicesRef.child(deviceId).child('sharedPermissions').child(targetUid).set(permissionLevel);
   }
 
   Future<void> unshareDevice(String deviceId, String targetUid) async {
     // Only the owner can unshare
     await _devicesRef.child(deviceId).child('sharedWith').child(targetUid).remove();
+    await _devicesRef.child(deviceId).child('sharedWithEmails').child(targetUid).remove();
+    await _devicesRef.child(deviceId).child('sharedPermissions').child(targetUid).remove();
+  }
+
+  Future<void> renameDevice(String deviceId, String newName) async {
+    await _devicesRef.child(deviceId).update({'name': newName});
+  }
+
+  /// Unregisters the device from the caller's account: clears ownership and
+  /// every sharedWith/permission/email entry, but leaves the device's own
+  /// data (frames, info, firmware) untouched so it can be re-added by
+  /// anyone later - this does not factory-reset or wipe the physical
+  /// device, just this app's record of who owns it.
+  Future<void> removeDevice(String deviceId) async {
+    await _devicesRef.child(deviceId).update({
+      'ownerId': null,
+      'sharedWith': null,
+      'sharedWithEmails': null,
+      'sharedPermissions': null,
+    });
+  }
+
+  /// Writes the real cloud-reachable restart command the firmware polls for
+  /// (firebase_check_for_reset_command in firebase.c) - the device clears
+  /// the command itself once it picks it up and reboots.
+  Future<void> restartDevice(String deviceId) async {
+    await _devicesRef.child(deviceId).child('commands/reset').set('reset');
+  }
+
+  /// Reads `sharedWith` UIDs for a device plus any emails/permission levels
+  /// recorded at share-time, for display on the Share Device page. Shares
+  /// created via the UID tab or an invite code never get a `sharedWithEmails`
+  /// entry written, so for those this falls back to a live reverse lookup of
+  /// `users/{uid}/email` (written by register()/signInWithGoogle for every
+  /// account) rather than showing the raw UID - only bare UID if that user
+  /// record is somehow missing entirely.
+  Future<List<Map<String, String>>> getSharedUsers(String deviceId) async {
+    final snapshot = await _devicesRef.child(deviceId).child('sharedWith').get();
+    if (!snapshot.exists || snapshot.value is! Map) return [];
+    final uids = (snapshot.value as Map).keys.map((k) => k.toString()).toList();
+
+    final emailsSnapshot = await _devicesRef.child(deviceId).child('sharedWithEmails').get();
+    final emails = emailsSnapshot.value is Map
+        ? Map<String, dynamic>.from(emailsSnapshot.value as Map)
+        : <String, dynamic>{};
+
+    final permissionsSnapshot = await _devicesRef.child(deviceId).child('sharedPermissions').get();
+    final permissions = permissionsSnapshot.value is Map
+        ? Map<String, dynamic>.from(permissionsSnapshot.value as Map)
+        : <String, dynamic>{};
+
+    final missingEmailUids = uids.where((uid) => emails[uid] == null).toList();
+    final lookedUp = await Future.wait(missingEmailUids.map((uid) => _usersRef.child(uid).child('email').get()));
+    final lookedUpEmails = <String, String>{};
+    for (var i = 0; i < missingEmailUids.length; i++) {
+      final value = lookedUp[i].value;
+      if (value != null) lookedUpEmails[missingEmailUids[i]] = value.toString();
+    }
+
+    return uids
+        .map((uid) => {
+              'uid': uid,
+              'label': emails[uid]?.toString() ?? lookedUpEmails[uid] ?? uid,
+              'permission': permissions[uid]?.toString() ?? 'view',
+            })
+        .toList();
+  }
+
+  /// Cosmetic activity-zone labels a user can tag for a device (see
+  /// device_calibration_wizard_page.dart / activity_zones_page.dart). The
+  /// firmware applies the same detection logic everywhere in range - these
+  /// are not enforced geofences, just organizational labels.
+  Future<List<String>> getZones(String deviceId) async {
+    final snapshot = await _devicesRef.child(deviceId).child('uiZones').get();
+    if (!snapshot.exists || snapshot.value is! List) return [];
+    return (snapshot.value as List).whereType<String>().toList();
+  }
+
+  Future<void> setZones(String deviceId, List<String> zones) async {
+    await _devicesRef.child(deviceId).child('uiZones').set(zones);
   }
 
   /// Look up a user's UID by their email address

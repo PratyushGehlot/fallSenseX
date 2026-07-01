@@ -178,6 +178,13 @@ static void fall_alert_task(void *arg)
 /* Firebase command task - periodically checks for reset commands */
 static void firebase_command_task(void *arg)
 {
+    /* Tracks the last-applied LED state so ws2812_set_brightness is only
+     * called on an actual change, not every 5s poll. Brightness (not color)
+     * is the toggle point because it's a single persistent multiplier
+     * applied in ws2812_led.c to every subsequent color-set call, so this
+     * doesn't need to touch the many status-indication call sites scattered
+     * through this file. */
+    bool led_enabled_applied = true;
     /* Wait for network connectivity before attempting HTTP requests */
     ESP_LOGI(TAG, "Firebase command task waiting for network...");
     while (!wifi_stream_is_connected() || !s_ntp_initialized) {
@@ -202,6 +209,13 @@ static void firebase_command_task(void *arg)
             if (cmd == FIREBASE_CMD_RESET) {
                 ESP_LOGW(TAG, "Reset command received from Firebase - restarting device");
                 esp_restart();
+            }
+
+            bool led_enabled = firebase_get_status_led_enabled();
+            if (led_enabled != led_enabled_applied) {
+                ws2812_set_brightness(led_enabled ? 255 : 0);
+                led_enabled_applied = led_enabled;
+                ESP_LOGI(TAG, "Status LED %s via Firebase preference", led_enabled ? "enabled" : "disabled");
             }
 
             /* Check for a remote OTA update command. Execution runs on its own

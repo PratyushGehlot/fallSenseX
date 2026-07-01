@@ -13,7 +13,20 @@
           "package_name": "com.example.fall_sense_x_mobile"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_id": "658583987580-kcvifqtm1t5rhu3sc0v7lpk8s82js9q7.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.fall_sense_x_mobile",
+            "certificate_hash": "46f8750b6e8247ec31eb8a28b80f8e7a476809e9"
+          }
+        },
+        {
+          "client_id": "658583987580-2qbo7cuqe8cq04hi6quuoqkd79vefblk.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
       "api_key": [
         {
           "current_key": "AIzaSyD6QNr8F0vfsNCgE2BwkSxlgNZxQBjTETw"
@@ -21,7 +34,19 @@
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_id": "658583987580-2qbo7cuqe8cq04hi6quuoqkd79vefblk.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "658583987580-fg69o12qe2eokdsgtat52ivlh2mkc9aq.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.fallSenseXMobile"
+              }
+            }
+          ]
         }
       }
     }
